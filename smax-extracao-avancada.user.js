@@ -101,10 +101,17 @@
     const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
     const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
     // Primeira página de cada lote menor e prioritária (canal próprio), pra
-    // mostrar algo na tela o quanto antes; o resto do lote usa páginas
-    // maiores, reduzindo o total de requisições pro grosso dos dados.
+    // mostrar algo na tela o quanto antes; o resto do lote usa páginas do
+    // mesmo tamanho.
     const FIRST_PAGE_SIZE = 150;
-    const BULK_PAGE_SIZE = 500;
+    // CRÍTICO PARA A COBERTURA: o tamanho da página em lote é TAMBÉM o passo
+    // do skip na paginação (skip += BULK_PAGE_SIZE, cada fetch pede size=
+    // BULK_PAGE_SIZE). Se o SMAX devolve MENOS registros do que o size pedido
+    // (ele limita a página abaixo de 500), o passo maior que o retorno pula o
+    // meio de cada bloco — perdendo ~metade das solicitações SEM erro nenhum.
+    // Por isso alinhado ao PAGE_SIZE já comprovado estável (250): passo ==
+    // tamanho == valor que o servidor honra, sem buracos por construção.
+    const BULK_PAGE_SIZE = 250;
     const PAGE_RESULTS = 15;
     const BATCH_SAFETY_LIMIT = 9500; // teto real do SMAX é 10.000; margem de segurança
     const OPEN_SELECTED_CAP = 15; // limite ao abrir várias abas de uma vez (evita bloqueio de pop-up)
@@ -1656,6 +1663,27 @@
             let splitRangeFrom = loadRange.from != null ? loadRange.from : ARCHIVE_EARLIEST_TIME;
             const splitRangeTo = loadRange.to != null ? loadRange.to : ARCHIVE_LATEST_TIME;
 
+            // ---- PRÉ-VOO (garantia de cobertura, grau-extração) -----------
+            // Mede o total AUTORITATIVO do SMAX para EXATAMENTE estes critérios
+            // (GSE + pessoa + período), sobre o range COMPLETO pedido — antes de
+            // qualquer encolhimento pela sincronização incremental mais abaixo.
+            // Esse número é a referência da reconciliação no fim da carga: se o
+            // que entrou não bater com ele, algo ficou pelo caminho (ainda que
+            // nenhuma página tenha acusado erro de rede). splitWindowUntilSafe já
+            // faz bisecção sob o teto de 10.000 e devolve as contagens reais; a
+            // soma é o total. "estimado" só aparece em janelas densas demais para
+            // confirmar isoladamente — nesse caso o total vira um piso (≥).
+            let expectedTotal = null, expectedEstimated = false;
+            if (!semGse) {
+                try {
+                    setProgress("Pré-voo: conferindo o total no SMAX...", 2);
+                    const preflightUnits = await splitWindowUntilSafe(groupIds, "pré-voo", splitRangeFrom, splitRangeTo, 0);
+                    expectedTotal = preflightUnits.reduce((sum, u) => sum + (u.total || 0), 0);
+                    expectedEstimated = preflightUnits.some(u => /estimado/.test(u.label || ""));
+                    setStatus(`SMAX reporta ${expectedEstimated ? "≥" : ""}${expectedTotal.toLocaleString("pt-BR")} solicitação(ões) para estes critérios. Carregando...`, "info");
+                } catch (_) { /* falha no pré-voo não impede a carga; só não haverá número de referência para a reconciliação */ }
+            }
+
             // ---- DISCUSSÃO LIGADA/DESLIGADA DEPOIS DE JÁ INDEXAR -----------
             // O índice guarda o texto que foi carregado NA HORA de indexar. Se a
             // GSE foi indexada SEM discussão e agora você liga "Discussão" (ou
@@ -1871,8 +1899,29 @@
 
             setProgress(`Acervo carregado: ${archive.length.toLocaleString("pt-BR")} solicitações`, 100);
             if (failedWindows.length) warnings.push(`Falha ao carregar: ${failedWindows.join(" | ")}`);
+
+            // ---- RECONCILIAÇÃO (garantia de cobertura) --------------------
+            // Compara o que efetivamente entrou (distinto, já deduplicado) com o
+            // total autoritativo medido no pré-voo. Um déficit aqui é o alarme
+            // contra FALHA SILENCIOSA — dispara mesmo quando nenhuma página
+            // acusou erro de rede, que é justamente o caso perigoso para quem vai
+            // montar gráficos com esses números. Sobra (carregou mais que o
+            // pré-voo) é normal: chamados podem ter entrado entre medir e baixar.
+            if (expectedTotal != null) {
+                const loaded = archive.length;
+                const deficit = expectedTotal - loaded;
+                if (deficit > 0 && !expectedEstimated) {
+                    warnings.push(`⚠ COBERTURA: o SMAX reporta ${expectedTotal.toLocaleString("pt-BR")} para estes critérios, mas só ${loaded.toLocaleString("pt-BR")} entraram — faltam ${deficit.toLocaleString("pt-BR")}. NÃO use este resultado para contagem sem antes clicar em "Reindexar do zero" e recarregar`);
+                    console.warn("[SMAX Extração] Déficit de cobertura", { expectedTotal, loaded, deficit, groupIds, from: splitRangeFrom, to: splitRangeTo });
+                } else {
+                    console.info("[SMAX Extração] Cobertura conferida", { expectedTotal, loaded, estimado: expectedEstimated });
+                }
+            }
+
             const warningNote = warnings.length ? ` ⚠ ${warnings.join(" · ")}. Clique em "Recarregar acervo" para tentar reaver o que faltou.` : "";
-            setStatus(`Acervo pronto (${archive.length.toLocaleString("pt-BR")} solicitações, ${windows.length} período(s)) — carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}.${warningNote}`, warnings.length ? "warning" : "success");
+            const coverageOk = expectedTotal != null && archive.length >= expectedTotal && !expectedEstimated;
+            const coverageNote = coverageOk ? ` · ✔ cobertura conferida (SMAX reportava ${expectedTotal.toLocaleString("pt-BR")})` : "";
+            setStatus(`Acervo pronto (${archive.length.toLocaleString("pt-BR")} solicitações, ${windows.length} período(s)) — carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}.${coverageNote}${warningNote}`, warnings.length ? "warning" : "success");
             renderStats();
 
             // ---- FASE 2 -------------------------------------------------
