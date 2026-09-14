@@ -276,6 +276,11 @@
     let archive = [];
     let archiveLoadedAt = null;
     let archiveLoading = false;
+    // Resultado da reconciliação de cobertura da última carga (garantia
+    // grau-extração). Fica no painel de contagens, que é persistente — a
+    // mensagem de status some assim que a busca automática a sobrescreve.
+    // { expected, loaded, ok, estimated, deficit } ou null (não medido).
+    let lastCoverage = null;
     let archiveCancelled = false;
     let results = [];
     let currentPage = 1;
@@ -1910,16 +1915,19 @@
             if (expectedTotal != null) {
                 const loaded = archive.length;
                 const deficit = expectedTotal - loaded;
+                lastCoverage = { expected: expectedTotal, loaded, deficit, estimated: expectedEstimated, ok: deficit <= 0 && !expectedEstimated };
                 if (deficit > 0 && !expectedEstimated) {
                     warnings.push(`⚠ COBERTURA: o SMAX reporta ${expectedTotal.toLocaleString("pt-BR")} para estes critérios, mas só ${loaded.toLocaleString("pt-BR")} entraram — faltam ${deficit.toLocaleString("pt-BR")}. NÃO use este resultado para contagem sem antes clicar em "Reindexar do zero" e recarregar`);
                     console.warn("[SMAX Extração] Déficit de cobertura", { expectedTotal, loaded, deficit, groupIds, from: splitRangeFrom, to: splitRangeTo });
                 } else {
                     console.info("[SMAX Extração] Cobertura conferida", { expectedTotal, loaded, estimado: expectedEstimated });
                 }
+            } else {
+                lastCoverage = null; // não medido (ex.: busca sem GSE)
             }
 
             const warningNote = warnings.length ? ` ⚠ ${warnings.join(" · ")}. Clique em "Recarregar acervo" para tentar reaver o que faltou.` : "";
-            const coverageOk = expectedTotal != null && archive.length >= expectedTotal && !expectedEstimated;
+            const coverageOk = lastCoverage && lastCoverage.ok;
             const coverageNote = coverageOk ? ` · ✔ cobertura conferida (SMAX reportava ${expectedTotal.toLocaleString("pt-BR")})` : "";
             setStatus(`Acervo pronto (${archive.length.toLocaleString("pt-BR")} solicitações, ${windows.length} período(s)) — carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}.${coverageNote}${warningNote}`, warnings.length ? "warning" : "success");
             renderStats();
@@ -4169,6 +4177,30 @@
     // ============================================================
     // ESTATÍSTICAS DO ACERVO CARREGADO
     // ============================================================
+    // Selo PERSISTENTE de cobertura no painel de contagens. Fica aqui (e não
+    // só na linha de status) porque a busca automática sobrescreve o status
+    // logo após a carga — o selo precisa sobreviver a isso para ser útil como
+    // garantia grau-extração.
+    function renderCoverageBadge() {
+        if (!ui.coverageBadge) return;
+        const c = lastCoverage;
+        if (!c) { ui.coverageBadge.hidden = true; return; }
+        ui.coverageBadge.hidden = false;
+        if (c.estimated) {
+            ui.coverageBadge.className = "coverage-badge est";
+            ui.coverageBadge.textContent = `≈ cobertura estimada (SMAX ≥ ${c.expected.toLocaleString("pt-BR")})`;
+            ui.coverageBadge.title = "Havia janelas densas demais para confirmar o total isoladamente; o número do SMAX é um piso.";
+        } else if (c.ok) {
+            ui.coverageBadge.className = "coverage-badge ok";
+            ui.coverageBadge.textContent = `✔ cobertura conferida (${c.expected.toLocaleString("pt-BR")})`;
+            ui.coverageBadge.title = `O SMAX reportava ${c.expected.toLocaleString("pt-BR")} para os critérios da carga e todas entraram.`;
+        } else {
+            ui.coverageBadge.className = "coverage-badge warn";
+            ui.coverageBadge.textContent = `⚠ faltam ${c.deficit.toLocaleString("pt-BR")} (SMAX: ${c.expected.toLocaleString("pt-BR")})`;
+            ui.coverageBadge.title = `O SMAX reportava ${c.expected.toLocaleString("pt-BR")} mas só ${c.loaded.toLocaleString("pt-BR")} entraram. Clique em "Reindexar do zero" e recarregue antes de contar.`;
+        }
+    }
+
     // Agrega e mostra a tira de contagens. Recebe o CONJUNTO a agregar —
     // por padrão o resultado da busca atual (foco em dados), caindo para o
     // acervo inteiro só quando ainda não houve busca (logo após a carga).
@@ -4195,6 +4227,7 @@
         ui.statsRange.textContent = Number.isFinite(oldest) && Number.isFinite(newest)
             ? `de ${formatDate(oldest)} até ${formatDate(newest)}`
             : "";
+        renderCoverageBadge();
         ui.statsGseList.innerHTML = ranked.map(([name, count]) => `
             <div class="gse-bar-row">
                 <span class="gse-bar-label" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
@@ -6283,6 +6316,11 @@
             .stats-main { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
             .stats-main .count { font-weight: 800; color: var(--v-accent); font-size: 13px; }
             .stats-main small { color: var(--v-muted-2); font-size: 10.5px; }
+            .coverage-badge { font-size: 11px; font-weight: 800; border-radius: 5px; padding: 3px 9px; white-space: nowrap; }
+            .coverage-badge[hidden] { display: none; }
+            .coverage-badge.ok { color: #15803d; background: #dcfce7; border: 1px solid #86efac; }
+            .coverage-badge.warn { color: #b91c1c; background: #fee2e2; border: 1px solid #fca5a5; }
+            .coverage-badge.est { color: #92400e; background: #fef3c7; border: 1px solid #fcd34d; }
             .stats-gse { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 3px 14px; max-height: 50px; overflow: auto; }
             .gse-bar-row { display: grid; grid-template-columns: 1fr 55px 30px; align-items: center; gap: 6px; font-size: 10px; }
             .gse-bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--v-text-3); }
@@ -6795,6 +6833,7 @@
             </header>
             <div class="stats-strip" hidden>
                 <div class="stats-main"><span class="count"></span><small class="loaded-at"></small><small class="range"></small></div>
+                <span class="coverage-badge" hidden></span>
                 <div class="stats-gse"></div>
             </div>
             <div class="index-strip" hidden>
@@ -7163,7 +7202,7 @@
             settingsSuggestedToggle: shadow.querySelector(".settings-suggested-toggle"), suggestedTeamsBox: shadow.getElementById("suggestedTeamsBox"), suggestedTeams: shadow.getElementById("suggestedTeams"),
             teamNewForm: shadow.getElementById("teamNewForm"), teamNewGseComboRoot: shadow.getElementById("teamNewGseCombo"), teamNewName: shadow.querySelector(".team-new-name"),
             teamNewCancel: shadow.querySelector(".team-new-cancel"), teamNewSave: shadow.querySelector(".team-new-save"),
-            statsStrip: shadow.querySelector(".stats-strip"), statsCount: shadow.querySelector(".count"), statsLoadedAt: shadow.querySelector(".loaded-at"), statsRange: shadow.querySelector(".range"), statsGseList: shadow.querySelector(".stats-gse"),
+            statsStrip: shadow.querySelector(".stats-strip"), statsCount: shadow.querySelector(".count"), statsLoadedAt: shadow.querySelector(".loaded-at"), statsRange: shadow.querySelector(".range"), statsGseList: shadow.querySelector(".stats-gse"), coverageBadge: shadow.querySelector(".coverage-badge"),
             indexStrip: shadow.querySelector(".index-strip"), indexDot: shadow.querySelector(".index-dot"), indexLabel: shadow.querySelector(".index-label"),
             indexTrack: shadow.querySelector(".index-track"), indexFill: shadow.querySelector(".index-fill"), indexReset: shadow.querySelector(".index-reset"),
             indexMeasure: shadow.querySelector(".index-measure"), indexReport: shadow.querySelector(".index-report"),
