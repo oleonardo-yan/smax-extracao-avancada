@@ -5903,8 +5903,8 @@
         ui.dateTo.value = filters.dateTo || "";
         ui.dateDays.value = filters.dateDays || "";
         updateDateControls();
-        openStatsTagIfFilled("statsEspSlot", specialistIds.length);
-        openStatsTagIfFilled("statsSolSlot", requestedForIds.length);
+        // Pessoas (Especialista/Solicitado) agora vivem em "Filtros avançados",
+        // não mais como tags nesta área — só Status/Unidade têm tag pra abrir.
         openStatsTagIfFilled("statsStatusSlot", (filters.statusValues && filters.statusValues.length) || (filters.statusOperacionalValues && filters.statusOperacionalValues.length));
         openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeValues && filters.unidadeValues.length);
     }
@@ -5959,7 +5959,7 @@
         const pref = findPreference(id);
         if (!pref) return;
         applyStatsFilters(pref.filters);
-        setStatus(`Preferência "${pref.name}" aplicada — clique em "Calcular" pra ver o resultado.`, "info");
+        setStatus(`Preferência "${pref.name}" aplicada — clique em "Pesquisar" pra ver o resultado.`, "info");
     }
 
     // Codifica em Base64 seguro pra UTF-8 (acentos/emoji), pra caber num
@@ -6329,23 +6329,8 @@
             .gse-bar-count { text-align: right; color: var(--v-accent); font-weight: 700; }
 
             .search-area { padding: 12px 20px 8px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); flex-shrink: 0; max-height: min(300px, 32vh); overflow-y: auto; }
-            .mode-radio { position: absolute; opacity: 0; pointer-events: none; }
-            .mode-tabs { display: flex; gap: 18px; margin-bottom: 10px; border-bottom: 1px solid var(--v-panel-border); }
-            .mode-tab {
-                height: 34px; padding: 0 2px; border: none; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 6px;
-                font-size: 12px; font-weight: 700; cursor: pointer;
-                background: transparent; color: var(--v-muted); margin-bottom: -1px;
-                transition: color .15s, border-color .15s;
-            }
-            .mode-tab-icon { width: 16px; height: 16px; stroke-width: 1.8; flex-shrink: 0; fill: none; stroke: currentColor; }
-            #tjspModeTerms:checked ~ .mode-tabs label[for="tjspModeTerms"],
-            #tjspModeStats:checked ~ .mode-tabs label[for="tjspModeStats"] { color: var(--v-accent); border-bottom-color: var(--v-accent); }
             .terms-mode { display: block; }
-            .stats-mode { display: none; max-width: 640px; }
-            #tjspModeStats:checked ~ .terms-mode { display: none; }
-            #tjspModeStats:checked ~ .stats-mode { display: block; }
-            .stats-intro { font-size: 12px; color: var(--v-muted); line-height: 1.6; margin: 0 0 10px; }
-            .stats-intro b { color: var(--v-text-2); font-weight: 700; }
+            .stats-mode { display: block; max-width: 640px; margin-top: 10px; }
             .stats-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
             .stats-row .control { max-width: 280px; flex: 1; min-width: 200px; }
             .stats-row .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
@@ -6845,18 +6830,6 @@
             </div>
             <div class="index-report" hidden></div>
             <section class="search-area">
-                <input type="radio" name="tjspSearchMode" id="tjspModeTerms" class="mode-radio" checked>
-                <input type="radio" name="tjspSearchMode" id="tjspModeStats" class="mode-radio">
-                <div class="mode-tabs">
-                    <label for="tjspModeTerms" class="mode-tab">
-                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"></circle><path d="M15 15L21 21"></path><text x="10" y="12.8" font-size="7" font-weight="800" text-anchor="middle" stroke="none" fill="currentColor">Aa</text></svg>
-                        Pesquisa por termos
-                    </label>
-                    <label for="tjspModeStats" class="mode-tab">
-                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><path d="M4 20V14"></path><path d="M11 20V8"></path><path d="M18 20V4"></path></svg>
-                        Busca Estatística
-                    </label>
-                </div>
                 <div class="terms-mode">
                     <div class="query-row">
                         <div class="query-wrap"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg><input class="query" type="text" placeholder='Termo opcional — deixe vazio para levantar só por filtros. Ex.: "erro ao assinar" E eproc -certificado'></div>
@@ -6874,7 +6847,6 @@
                     <div class="query-validator" hidden></div>
                 </div>
                 <div class="stats-mode">
-                    <p class="stats-intro">GSE já vem pronta pra usar (sem ela não tem o que contar) — o período fica sempre visível ali embaixo, junto das opções de busca, e já entra na própria consulta ao SMAX. Os demais filtros são opcionais — clique pra abrir só os que for usar.</p>
                     <div class="prefs-block">
                         <p class="stats-tag-title">Preferências</p>
                         <div class="prefs-bar"></div>
@@ -6888,17 +6860,12 @@
                             <button type="button" class="prefs-import-btn pref-action">⬇ Importar</button>
                         </div>
                     </div>
-                    <div class="stats-fixed" id="statsGseSlot"></div>
-                    <p class="stats-tag-title">Outros filtros</p>
+                    <p class="stats-tag-title">Filtros de classificação</p>
                     <div class="stats-tag-row">
-                        <button type="button" class="stats-tag" data-slot="statsEspSlot">+ Designado Especialista</button>
-                        <button type="button" class="stats-tag" data-slot="statsSolSlot">+ Solicitado para</button>
                         <button type="button" class="stats-tag" data-slot="statsStatusSlot">+ Status</button>
                         <button type="button" class="stats-tag" data-slot="statsUnidadeSlot">+ Unidade/Comarca</button>
                     </div>
                     <div class="stats-tag-fields">
-                        <div class="stats-tag-slot" id="statsEspSlot" hidden></div>
-                        <div class="stats-tag-slot" id="statsSolSlot" hidden></div>
                         <div class="stats-tag-slot" id="statsStatusSlot" hidden>
                             <div class="control"><label>Status</label>
                                 <div class="combo" id="statusCombo">
@@ -6935,7 +6902,6 @@
                             </div>
                         </div>
                     </div>
-                    <div class="stats-row"><button class="stats-search" type="button">Calcular</button></div>
                 </div>
             </section>
             <div class="actions-row">
@@ -7007,7 +6973,7 @@
                                 </div>
                                 <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
                             </div>
-                            <label class="option ignore-gse-wrap" hidden><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
+                            <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Passou por GSE</h3>
                             <small class="person-hint">Mostrar somente solicitações que passaram por estas GSEs (consulta o histórico de cada uma).</small>
@@ -7525,10 +7491,8 @@
         ui.query.addEventListener("blur", renderQueryValidator);
         ui.query.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); if (renderQueryValidator()) performSearch(); } });
         ui.mode.addEventListener("change", renderQueryValidator);
-        // Alternância de modo agora é 100% CSS — os radios ocultos
-        // (#tjspModeTerms/#tjspModeStats) controlam visibilidade e o estado
-        // marcado dos botões via seletor de irmão (~), sem JS.
-        ui.statsSearch.addEventListener("click", performStatsSearch);
+        // Tela única: não há mais abas. A busca (com ou sem termo) e todos os
+        // filtros vivem no mesmo fluxo; o botão "Pesquisar" resolve os dois.
         try { const savedView = localStorage.getItem(STATS_VIEW_STORAGE_KEY); if (savedView === "grid" || savedView === "table") statsViewMode = savedView; } catch (_) {}
         ui.statsViewToggle.querySelectorAll(".view-btn").forEach(btn => {
             if (btn.dataset.view === statsViewMode) btn.classList.add("active"); else btn.classList.remove("active");
@@ -7602,8 +7566,6 @@
             ui.ignoreGseWrap.hidden = true;
             shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = false; });
         }
-        shadow.querySelector("#tjspModeStats").addEventListener("change", () => { if (shadow.querySelector("#tjspModeStats").checked) { moveIntoStats(); enterResultsBucket("stats"); } });
-        shadow.querySelector("#tjspModeTerms").addEventListener("change", () => { if (shadow.querySelector("#tjspModeTerms").checked) { restoreFromStats(); enterResultsBucket("text"); } });
         shadow.querySelectorAll(".stats-tag").forEach(tag => {
             tag.addEventListener("click", () => {
                 const slot = shadow.getElementById(tag.dataset.slot);
