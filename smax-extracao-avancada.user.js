@@ -153,11 +153,8 @@
     const PREFS_SHARE_PREFIX = "TJSP-PREF1:"; // marca o código de compartilhamento (copiar/colar) e sua versão de formato
     const PREFS_VISIBLE_FAVORITES = 3; // só as favoritas viram chip fixo — o resto fica em "Ver todas"
 
-    // Busca por semelhança (BM25) — 100% local, sem chamada de rede/IA.
-    const BM25_K1 = 1.4;
-    const BM25_B = 0.75;
+    // Tokenização do índice de termos (radical mínimo + stopwords).
     const SEMANTIC_MIN_TOKEN_LEN = 3;
-    const SEMANTIC_DEFAULT_LIMIT = 50;
     const STOPWORDS_PT = new Set([
         "a", "ao", "aos", "aquela", "aquelas", "aquele", "aqueles", "aquilo", "as", "até", "com", "como",
         "da", "das", "de", "dela", "delas", "dele", "deles", "depois", "do", "dos", "e", "ela", "elas",
@@ -295,12 +292,9 @@
     let customTeams = []; // equipes criadas pelo usuário, carregadas do localStorage no init — somadas às NATIVE_TEAMS
     let gseListComboInstance = null; // adapta a lista de checkboxes principal pro mesmo helper renderTeamTogglers usa nos combos de verdade
     let teamNewGseCombo = null; // combobox do formulário "+ Nova equipe", instalado uma vez sob demanda
-    let resultsBucket = "text"; // "text" (Termos + Semelhança, compartilham resultado) ou "stats" — cada lado guarda o próprio resultado/paginação
+    let resultsBucket = "text"; // "text" (busca por termo) ou "stats" — cada lado guarda o próprio resultado/paginação
     let textResultsStash = null;
     let statsResultsStash = null;
-    let semanticIndex = null;
-    let semanticScores = new Map();
-    let semanticMaxScore = 1;
     const selectedIds = new Set();
     // Registro completo de cada item marcado, por ID — sobrevive à troca do
     // `archive` (pesquisa diferente) porque exportRows() precisa dos dados
@@ -1604,7 +1598,6 @@
         // conteúdo em vez da vazia — evita cartão compacto e modo expandido
         // mostrando o mesmo chamado com dados diferentes).
         const archiveIdIndex = new Map();
-        semanticIndex = null;
         // A seleção (checkbox de exportação) NÃO zera aqui de propósito: é pra
         // sobreviver a uma pesquisa diferente (outras GSEs/filtros), que troca
         // este `archive` inteiro por outro. Só assim dá pra marcar itens em
@@ -1633,7 +1626,6 @@
         ui.loadButton.disabled = true;
         ui.cancelLoad.hidden = false;
         refreshSearchButtonState();
-        ui.semanticSearch.disabled = true;
         ui.exportButton.disabled = true;
         ui.copyButton.disabled = true;
         const periodMode = ui.dateMode.value;
@@ -1923,7 +1915,6 @@
             ui.loadButton.disabled = false;
             ui.cancelLoad.hidden = true;
             refreshSearchButtonState();
-            ui.semanticSearch.disabled = false;
             ui.copyButton.disabled = !archive.length;
             ui.exportButton.disabled = !archive.length;
         }
@@ -2011,7 +2002,6 @@
             // cartões que aparecem na tela.
             archive.forEach(offloadText);
             textInMemory = false;
-            semanticIndex = null; // o índice em memória do BM25 não é mais usado nem necessário
 
             indexing = false;
             indexProgress = null;
@@ -3780,11 +3770,11 @@
     }
 
     // ============================================================
-    // BUSCA POR SEMELHANÇA (BM25) — 100% local, sem chamada de rede/IA.
-    // Compara o texto colado (descrição do chamado atual) com cada
-    // solicitação já carregada em memória, usando o mesmo tipo de algoritmo
-    // de ranking por relevância usado por buscadores de texto como o
-    // Elasticsearch. Nada sai do navegador nessa etapa.
+    // TOKENIZAÇÃO PARA O ÍNDICE (busca por termo) — 100% local.
+    // Reduz o texto de cada solicitação a radicais comparáveis, alimentando
+    // o índice invertido em disco que a busca por termo consulta. (A antiga
+    // busca por semelhança/BM25 foi removida nesta ferramenta de extração;
+    // esta tokenização permanece porque a indexação por termo depende dela.)
     // ============================================================
     // Stemmer leve (não é o RSLP completo): normaliza plural simples e
     // advérbios em "-mente" pra aumentar recall sem arriscar juntar palavras
@@ -3805,191 +3795,6 @@
             out.push(stemLight(token));
         }
         return out;
-    }
-
-    // Índice invertido: termo -> Map(índice do chamado no acervo -> frequência).
-    // Construído sob demanda (uma vez por carga do acervo, na primeira busca
-    // por semelhança) — evita gastar tempo indexando se o recurso não for usado.
-    function buildSemanticIndex() {
-        const postings = new Map();
-        const docLen = new Array(archive.length);
-        let totalLen = 0;
-        for (let idx = 0; idx < archive.length; idx++) {
-            const item = archive[idx];
-            const terms = tokenizeForIndex(`${item.description} ${item.solution} ${item.discussion}`);
-            docLen[idx] = terms.length;
-            totalLen += terms.length;
-            const tf = new Map();
-            for (const term of terms) tf.set(term, (tf.get(term) || 0) + 1);
-            tf.forEach((count, term) => {
-                let bucket = postings.get(term);
-                if (!bucket) { bucket = new Map(); postings.set(term, bucket); }
-                bucket.set(idx, count);
-            });
-        }
-        semanticIndex = { postings, docLen, avgDocLen: totalLen / (archive.length || 1), N: archive.length, builtForLength: archive.length };
-    }
-
-    function ensureSemanticIndex() {
-        if (!semanticIndex || semanticIndex.builtForLength !== archive.length) buildSemanticIndex();
-    }
-
-    // ------------------------------------------------------------
-    // BM25 lendo do disco (usado quando o índice está pronto)
-    // ------------------------------------------------------------
-    // Mesma fórmula do original — o que muda é de onde vêm os números:
-    //   df  ....... o tamanho da lista de postings do termo (nada guardado à parte)
-    //   tf  ....... do campo "terms" gravado em cada chamado
-    //   docLen .... do campo "docLen" de cada chamado
-    //   N/avgDocLen  da linha "corpus" da tabela settings
-    // Assim nenhum Map gigante de postings é montado na memória.
-    // Agora a consulta lê UMA linha por termo da pergunta (tipicamente ~10),
-    // em vez de uma linha por chamado candidato (que eram milhares na v2). A
-    // frequência de cada termo em cada chamado vem junto da própria lista.
-    async function computeBm25ScoresFromDisk(queryTerms, docLenByDocId) {
-        const uniqueTerms = Array.from(new Set(queryTerms));
-        const [{ N, avgDocLen }, rows] = await Promise.all([
-            getCorpusStats(),
-            db.stemPostings.bulkGet(uniqueTerms)
-        ]);
-        const scores = new Map(); // docId -> pontuação
-        const termWeights = new Map();
-        if (!N) return { scores, termWeights };
-
-        rows.forEach((row, index) => {
-            if (!row || !row.ids || !row.ids.length) return;
-            // O "df" é simplesmente o tamanho da lista — não precisa mais ser
-            // guardado à parte, o que também elimina o risco de ele sair de
-            // sincronia com os postings depois de uma carga incremental.
-            const df = row.ids.length;
-            const idf = Math.max(0.01, Math.log(1 + (N - df + 0.5) / (df + 0.5)));
-            termWeights.set(uniqueTerms[index], idf);
-            for (let position = 0; position < row.ids.length; position++) {
-                const docId = row.ids[position];
-                const tf = row.tfs ? row.tfs[position] : 1;
-                const docLen = docLenByDocId.get(docId) || 0;
-                const denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * (docLen / (avgDocLen || 1)));
-                scores.set(docId, (scores.get(docId) || 0) + idf * (tf * (BM25_K1 + 1)) / (denom || 1));
-            }
-        });
-        return { scores, termWeights };
-    }
-
-    // Versão da busca por semelhança que usa o índice em disco. Diferente da
-    // original, pontua por ID (não por posição no array), porque o acervo em
-    // memória agora guarda só os campos estruturados.
-    async function runSemanticSearchIndexed(text) {
-        searchMode = "semantic";
-        lastSearchIncludedDiscussion = archiveIncludesDiscussion;
-        const queryTerms = tokenizeForIndex(text);
-        if (!queryTerms.length) { setStatus("Não encontramos termos relevantes nesse texto (tente descrever com mais detalhes).", "warning"); return; }
-        // O tamanho de cada chamado (em termos) já veio junto dos metadados, na
-        // memória — o BM25 não precisa ir ao disco buscar isso.
-        const docLenByDocId = new Map();
-        archive.forEach(item => { if (item.docId != null) docLenByDocId.set(item.docId, item.docLen || 0); });
-        const { scores, termWeights } = await computeBm25ScoresFromDisk(queryTerms, docLenByDocId);
-        const limit = Number(ui.semanticLimit.value) || SEMANTIC_DEFAULT_LIMIT;
-        const ranked = archive
-            .filter(item => item.docId != null && scores.has(item.docId) && advancedFiltersMatch(item))
-            .map(item => ({ item, score: scores.get(item.docId) }))
-            .sort((a, b) => b.score - a.score)
-            .slice(0, limit);
-
-        lastQueryTerms = Array.from(termWeights.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([term]) => term);
-        relevanceCache.clear();
-        semanticScores = new Map(ranked.map(entry => [entry.item.id, entry.score]));
-        semanticMaxScore = ranked.length ? ranked[0].score : 1;
-        results = ranked.map(entry => entry.item);
-        currentPage = 1;
-        focusedIndex = -1;
-        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
-        sortMode = "similarity";
-        ui.sortSelect.value = "similarity";
-        activeIndex = results.length ? 0 : -1;
-        renderResults();
-        setStatus(results.length
-            ? `${results.length.toLocaleString("pt-BR")} caso(s) semelhante(s) encontrado(s) em ${archive.length.toLocaleString("pt-BR")} solicitações carregadas — via índice em disco, 100% local, nada enviado pra fora.`
-            : "Nenhum caso semelhante encontrado (tente descrever com outras palavras).", results.length ? "success" : "warning");
-    }
-
-    // BM25: pondera termos raros no acervo (IDF alto) mais que termos comuns,
-    // e normaliza pelo tamanho de cada chamado (chamados muito longos não
-    // vencem só por terem mais palavras). Piso no IDF evita score negativo
-    // para termos muito comuns que escaparam da lista de stopwords.
-    function computeBm25Scores(queryTerms) {
-        const { postings, docLen, avgDocLen, N } = semanticIndex;
-        const scores = new Map();
-        const termWeights = new Map();
-        Array.from(new Set(queryTerms)).forEach(term => {
-            const bucket = postings.get(term);
-            if (!bucket) return;
-            const df = bucket.size;
-            const idf = Math.max(0.01, Math.log(1 + (N - df + 0.5) / (df + 0.5)));
-            termWeights.set(term, idf);
-            bucket.forEach((tf, idx) => {
-                const dl = docLen[idx] || 0;
-                const denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * (dl / (avgDocLen || 1)));
-                scores.set(idx, (scores.get(idx) || 0) + idf * (tf * (BM25_K1 + 1)) / (denom || 1));
-            });
-        });
-        return { scores, termWeights };
-    }
-
-    // Adia o trabalho pesado um tick (setTimeout 0) só pra garantir que a
-    // mensagem "Indexando..." pinte na tela antes do cálculo síncrono travar
-    // a thread por um instante em acervos muito grandes.
-    async function performSemanticSearch() {
-        userEngagedWithResults = false; // pesquisa nova de propósito — não precisa mais preservar o que estava aberto
-        const text = ui.semanticQuery.value.trim();
-        if (!text) { setStatus("Cole a descrição do chamado atual no campo de busca por semelhança.", "warning"); return; }
-        await ensureArchiveLoaded();
-        if (!archive.length) return;
-        ui.semanticSearch.disabled = true;
-        // Com o índice pronto, não há mais o que "indexar na primeira busca" —
-        // as estatísticas do BM25 já foram gravadas na Fase 2, então a busca
-        // vai direto ao disco. Sem índice ainda, mantém o comportamento antigo.
-        if (indexReady) {
-            setStatus("Comparando com o acervo indexado...", "info");
-            try { await runSemanticSearchIndexed(text); await maybeApplyHistoryGseFilter(); }
-            catch (error) { setStatus(error.message || String(error), "error"); }
-            finally { ui.semanticSearch.disabled = false; }
-            return;
-        }
-        setStatus("Indexando o acervo para busca por semelhança (só na primeira busca após carregar)...", "info");
-        setTimeout(async () => {
-            try { runSemanticSearch(text); await maybeApplyHistoryGseFilter(); }
-            finally { ui.semanticSearch.disabled = false; }
-        }, 20);
-    }
-
-    function runSemanticSearch(text) {
-        searchMode = "semantic";
-        lastSearchIncludedDiscussion = archiveIncludesDiscussion;
-        ensureSemanticIndex();
-        const queryTerms = tokenizeForIndex(text);
-        if (!queryTerms.length) { setStatus("Não encontramos termos relevantes nesse texto (tente descrever com mais detalhes).", "warning"); return; }
-        const { scores, termWeights } = computeBm25Scores(queryTerms);
-        const limit = Number(ui.semanticLimit.value) || SEMANTIC_DEFAULT_LIMIT;
-        const ranked = Array.from(scores.entries())
-            .map(([idx, score]) => ({ item: archive[idx], score }))
-            .filter(entry => entry.item && advancedFiltersMatch(entry.item))
-            .sort((a, b) => b.score - a.score)
-            .slice(0, limit);
-
-        lastQueryTerms = Array.from(termWeights.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([term]) => term);
-        semanticScores = new Map(ranked.map(entry => [entry.item.id, entry.score]));
-        semanticMaxScore = ranked.length ? ranked[0].score : 1;
-        results = ranked.map(entry => entry.item);
-        currentPage = 1;
-        focusedIndex = -1;
-        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
-        sortMode = "similarity";
-        ui.sortSelect.value = "similarity";
-        activeIndex = results.length ? 0 : -1;
-        renderResults();
-        setStatus(results.length
-            ? `${results.length.toLocaleString("pt-BR")} caso(s) semelhante(s) encontrado(s) em ${archive.length.toLocaleString("pt-BR")} solicitações carregadas — busca 100% local, nada enviado pra fora.`
-            : "Nenhum caso semelhante encontrado (tente descrever com outras palavras).", results.length ? "success" : "warning");
     }
 
     // Lê os controles e compila o comparador — pode ser chamado uma vez e
@@ -4188,7 +3993,6 @@
         userEngagedWithResults = false;
         try {
             searchMode = "terms";
-            if (sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
             const prepared = prepareTermSearch();
             await forceReloadIfDiscussionMissing();
             await ensureArchiveLoaded(() => applyTermSearch(prepared, true));
@@ -4224,7 +4028,6 @@
         userEngagedWithResults = false;
         try {
             searchMode = "stats";
-            if (sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
             await ensureArchiveLoaded(() => applyStatsFilter(true));
             if (!archive.length) return;
             applyStatsFilter(false);
@@ -4293,7 +4096,6 @@
                 renderResults();
             });
         }
-        else if (sortMode === "similarity") results.sort((a, b) => (semanticScores.get(b.id) || 0) - (semanticScores.get(a.id) || 0));
     }
 
     // ============================================================
@@ -5429,17 +5231,17 @@
     function enterResultsBucket(bucket) {
         if (bucket === resultsBucket) return;
         swapFilterState(resultsBucket, bucket);
-        const outgoing = { results, currentPage, activeIndex, focusedIndex, sortMode, lastQueryTerms, lastSearchIncludedDiscussion, semanticScores, semanticMaxScore, searchMode };
+        const outgoing = { results, currentPage, activeIndex, focusedIndex, sortMode, lastQueryTerms, lastSearchIncludedDiscussion, searchMode };
         if (resultsBucket === "text") textResultsStash = outgoing; else statsResultsStash = outgoing;
         resultsBucket = bucket;
         const incoming = bucket === "text" ? textResultsStash : statsResultsStash;
         if (incoming) {
             results = incoming.results; currentPage = incoming.currentPage; activeIndex = incoming.activeIndex; focusedIndex = incoming.focusedIndex;
             sortMode = incoming.sortMode; lastQueryTerms = incoming.lastQueryTerms; lastSearchIncludedDiscussion = incoming.lastSearchIncludedDiscussion;
-            semanticScores = incoming.semanticScores; semanticMaxScore = incoming.semanticMaxScore; searchMode = incoming.searchMode;
+            searchMode = incoming.searchMode;
         } else {
             results = []; currentPage = 1; activeIndex = -1; focusedIndex = -1;
-            lastQueryTerms = []; lastSearchIncludedDiscussion = false; semanticScores = new Map(); semanticMaxScore = 1;
+            lastQueryTerms = []; lastSearchIncludedDiscussion = false;
             sortMode = "recent"; searchMode = bucket === "stats" ? "stats" : "terms";
         }
         if (ui.sortSelect) ui.sortSelect.value = sortMode;
@@ -5525,9 +5327,7 @@
         const fragment = document.createDocumentFragment();
         pageItems.forEach((item, localIndex) => {
             const globalIndex = start + localIndex;
-            const isSemanticResult = searchMode === "semantic" && semanticScores.has(item.id);
-            const similarityPct = isSemanticResult ? Math.round((semanticScores.get(item.id) / (semanticMaxScore || 1)) * 100) : 0;
-            const occurrences = !isSemanticResult && lastQueryTerms.length ? countOccurrences(item) : 0;
+            const occurrences = lastQueryTerms.length ? countOccurrences(item) : 0;
             const card = document.createElement("article");
             card.className = "result-card" + (item.isVip ? " vip" : "") + (globalIndex === activeIndex ? " active" : "");
             card.dataset.index = String(globalIndex);
@@ -5537,7 +5337,7 @@
                     <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>${escapeHtml(item.id)}</a>
                     ${item.isVip ? '<span class="vip-badge"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="currentColor"><path d="M12 2l2.9 6.6 7.1.6-5.4 4.7 1.7 7-6.3-3.9-6.3 3.9 1.7-7L2 9.2l7.1-.6z"></path></svg>VIP</span>' : ""}${item.isGlobal ? '<span class="global-badge">GLOBAL</span>' : ""}
                     <span class="gse-tag">${escapeHtml(item.groupName)}</span>
-                    ${isSemanticResult ? `<span class="sim-badge">${similarityPct}% semelhante</span>` : (occurrences ? `<span class="occ-badge">${occurrences}×</span>` : "")}
+                    ${occurrences ? `<span class="occ-badge">${occurrences}×</span>` : ""}
                     <span class="date">Criado em ${escapeHtml(formatDate(item.created))}</span>
                     <button class="icon-btn expand-one" type="button" title="Expandir"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg></button>
                 </header>
@@ -5891,7 +5691,7 @@
         ui.settingsOverlay.querySelector("h3").textContent = settingsMandatory ? "Bem-vindo! Escolha suas GSEs" : "Configurações do script";
         ui.settingsOverlay.querySelector(".settings-hint").textContent = settingsMandatory
             ? "Para começar, escolha as GSEs que você acompanha. Você pode selecioná-las abaixo, adotar uma equipe pronta em \"Equipes sugeridas\", ou montar a sua em \"Criar equipe\". Elas ficam marcadas toda vez que abrir o script, e valem pras 3 abas."
-            : "Ficam marcadas toda vez que você abrir a pesquisa. Dá pra desmarcar ou adicionar outras pontualmente em cada busca (inclusive pela busca de \"Outras GSEs\") sem afetar essa configuração — e valem pras 3 abas (Termos, Semelhança e Estatística), que compartilham a mesma seleção.";
+            : "Ficam marcadas toda vez que você abrir a pesquisa. Dá pra desmarcar ou adicionar outras pontualmente em cada busca (inclusive pela busca de \"Outras GSEs\") sem afetar essa configuração — e valem pras 2 abas (Termos e Estatística), que compartilham a mesma seleção.";
         // Equipes com estado marcado/desmarcado, refletindo o que já está na
         // seleção de GSEs padrão. Adotar/desadotar atualiza os dois lados.
         renderTeamTogglers(ui.settingsUserTeams, customTeams, ui.settingsGseCombo);
@@ -6424,13 +6224,10 @@
             }
             .mode-tab-icon { width: 16px; height: 16px; stroke-width: 1.8; flex-shrink: 0; fill: none; stroke: currentColor; }
             #tjspModeTerms:checked ~ .mode-tabs label[for="tjspModeTerms"],
-            #tjspModeSimilar:checked ~ .mode-tabs label[for="tjspModeSimilar"],
             #tjspModeStats:checked ~ .mode-tabs label[for="tjspModeStats"] { color: var(--v-accent); border-bottom-color: var(--v-accent); }
             .terms-mode { display: block; }
-            .semantic-mode { display: none; }
             .stats-mode { display: none; max-width: 640px; }
-            #tjspModeSimilar:checked ~ .terms-mode, #tjspModeStats:checked ~ .terms-mode { display: none; }
-            #tjspModeSimilar:checked ~ .semantic-mode { display: block; }
+            #tjspModeStats:checked ~ .terms-mode { display: none; }
             #tjspModeStats:checked ~ .stats-mode { display: block; }
             .stats-intro { font-size: 12px; color: var(--v-muted); line-height: 1.6; margin: 0 0 10px; }
             .stats-intro b { color: var(--v-text-2); font-weight: 700; }
@@ -6532,15 +6329,6 @@
             .operator { height: 25px; padding: 0 8px; border: 1px solid var(--v-accent-soft-border); border-radius: 5px; background: var(--v-accent-soft); color: var(--v-accent); cursor: pointer; }
             .operator:hover { background: var(--v-accent-soft-hover); }
 
-            .semantic-query { width: 100%; min-height: 64px; padding: 10px 12px; border: 1px solid var(--v-input-border); border-radius: 6px; outline: none; font-size: 13px; resize: vertical; font-family: inherit; background: var(--v-panel); color: var(--v-text); }
-            .semantic-query:focus { border-color: var(--v-accent); box-shadow: 0 0 0 3px var(--v-focus-shadow); }
-            .semantic-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
-            .semantic-search { height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: var(--v-accent); color: #fff; font-weight: 700; font-size: 12.5px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
-            .semantic-search svg { width: 16px; height: 16px; flex-shrink: 0; }
-            .semantic-search:disabled { opacity: .5; cursor: not-allowed; }
-            .semantic-limit-label { font-size: 12px; color: var(--v-muted-2); display: flex; align-items: center; gap: 6px; }
-            .semantic-limit-label select { height: 28px; padding: 0 6px; border: 1px solid var(--v-input-border); border-radius: 5px; background: var(--v-panel); color: var(--v-text); }
-            .semantic-actions small { color: var(--v-muted-3); font-size: 11px; }
 
             .actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 20px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); position: relative; flex-shrink: 0; }
             .btn { height: 32px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
@@ -6718,7 +6506,6 @@
             .global-badge { font-size: 10px; font-weight: 800; color: var(--v-accent); background: var(--v-accent-soft); border: 1px solid var(--v-accent-soft-border); border-radius: 4px; padding: 1px 7px; }
             .gse-tag { font-size: 10.5px; font-weight: 700; color: var(--v-accent); background: var(--v-accent-soft); border-radius: 4px; padding: 2px 8px; }
             .occ-badge { font-size: 10px; font-weight: 800; color: var(--v-occ-text); background: var(--v-occ-bg); border-radius: 4px; padding: 2px 7px; }
-            .sim-badge { font-size: 10px; font-weight: 800; color: var(--v-accent); background: var(--v-sim-bg); border: 1px solid var(--v-sim-border); border-radius: 4px; padding: 2px 7px; }
             .result-card header .date { margin-left: auto; font-size: 11px; color: var(--v-muted-3); }
             .icon-btn { width: 26px; height: 26px; padding: 0; border: 1px solid var(--v-accent-soft-border); border-radius: 6px; background: var(--v-accent-soft); color: var(--v-accent); cursor: pointer; display: flex; align-items: center; justify-content: center; }
             .icon-btn:hover { background: var(--v-accent-soft-hover); }
@@ -6918,7 +6705,7 @@
         <div class="overlay"><section class="dialog"><div class="dialog-zoom">
             <header class="top">
                 <svg class="top-icon" viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg>
-                <div class="top-titles"><h2>Pesquisa Avançada SMAX</h2><small>v${VERSION} · Pesquisa por termos, por semelhança e estatística nas solicitações do SMAX</small></div>
+                <div class="top-titles"><h2>Pesquisa Avançada SMAX</h2><small>v${VERSION} · Pesquisa por termos e estatística nas solicitações do SMAX</small></div>
                 <button class="header-icon-btn theme-toggle" type="button" title="Alternar tema claro/escuro">
                     <svg class="icon-moon" viewBox="0 0 24 24"><path d="M21 12.5A8.5 8.5 0 1111.5 3a7 7 0 009.5 9.5z"></path></svg>
                     <svg class="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"></circle><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"></path></svg>
@@ -6943,16 +6730,11 @@
             <div class="index-report" hidden></div>
             <section class="search-area">
                 <input type="radio" name="tjspSearchMode" id="tjspModeTerms" class="mode-radio" checked>
-                <input type="radio" name="tjspSearchMode" id="tjspModeSimilar" class="mode-radio">
                 <input type="radio" name="tjspSearchMode" id="tjspModeStats" class="mode-radio">
                 <div class="mode-tabs">
                     <label for="tjspModeTerms" class="mode-tab">
                         <svg class="mode-tab-icon" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"></circle><path d="M15 15L21 21"></path><text x="10" y="12.8" font-size="7" font-weight="800" text-anchor="middle" stroke="none" fill="currentColor">Aa</text></svg>
                         Pesquisa por termos
-                    </label>
-                    <label for="tjspModeSimilar" class="mode-tab">
-                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><path d="M12 6L5.5 17.5M12 6L18.5 17.5M6 18H18" stroke-linecap="round"></path><circle cx="12" cy="5.5" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="5" cy="18" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="19" cy="18" r="2.1" fill="currentColor" stroke="none"></circle></svg>
-                        Pesquisa por semelhança
                     </label>
                     <label for="tjspModeStats" class="mode-tab">
                         <svg class="mode-tab-icon" viewBox="0 0 24 24"><path d="M4 20V14"></path><path d="M11 20V8"></path><path d="M18 20V4"></path></svg>
@@ -6974,21 +6756,6 @@
                         <button class="operator" data-insert="-" title="Atalho de exclusão">−</button>
                     </div>
                     <div class="query-validator" hidden></div>
-                </div>
-                <div class="semantic-mode">
-                    <textarea class="semantic-query" rows="3" placeholder="Cole aqui a descrição do chamado atual. O motor encontra, dentro do acervo já carregado, as solicitações mais parecidas por vocabulário (BM25) — 100% local, sem IA, nada enviado pra fora."></textarea>
-                    <div class="semantic-actions">
-                        <button class="semantic-search" type="button"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" fill="none"><path d="M12 6L5.5 17.5M12 6L18.5 17.5M6 18H18" stroke-linecap="round"></path><circle cx="12" cy="5.5" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="5" cy="18" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="19" cy="18" r="2.1" fill="currentColor" stroke="none"></circle></svg>Buscar casos semelhantes</button>
-                        <label class="semantic-limit-label">Mostrar até
-                            <select class="semantic-limit">
-                                <option value="20">20</option>
-                                <option value="50" selected>50</option>
-                                <option value="100">100</option>
-                                <option value="200">200</option>
-                            </select> resultados
-                        </label>
-                        <small>Ctrl+Enter busca · funciona melhor com 1-3 frases descrevendo o caso.</small>
-                    </div>
                 </div>
                 <div class="stats-mode">
                     <p class="stats-intro">GSE já vem pronta pra usar (sem ela não tem o que contar) — o período fica sempre visível ali embaixo, junto das opções de busca, e já entra na própria consulta ao SMAX. Os demais filtros são opcionais — clique pra abrir só os que for usar.</p>
@@ -7062,10 +6829,10 @@
                 <div class="field-checks"><span class="field-checks-label">Buscar em:</span>
                     <label class="option-inline"><input class="field-description" type="checkbox" checked><span>Descrição</span></label>
                     <label class="option-inline"><input class="field-solution" type="checkbox" checked><span>Solução</span></label>
-                    <label class="option-inline" title="Precisa estar marcada ANTES de clicar em Pesquisar/Buscar semelhantes na primeira vez — o acervo recarrega sozinho quando isso muda."><input class="field-discussion" type="checkbox"><span>Discussão</span><svg class="info-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5.5"></path><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"></circle></svg></label>
+                    <label class="option-inline" title="Precisa estar marcada ANTES de clicar em Pesquisar na primeira vez — o acervo recarrega sozinho quando isso muda."><input class="field-discussion" type="checkbox"><span>Discussão</span><svg class="info-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5.5"></path><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"></circle></svg></label>
                 </div>
                 <select class="mode control-inline"><option value="any">Qualquer palavra</option><option value="exact">Expressão exata</option></select>
-                <select class="sort-select"><option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option><option value="relevance" class="sort-text-only">Mais ocorrências</option><option value="similarity" class="sort-text-only">Mais semelhantes</option></select>
+                <select class="sort-select"><option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option><option value="relevance" class="sort-text-only">Mais ocorrências</option></select>
                 <div class="period-group" title="Restringe a própria consulta ao SMAX — mudar o período recarrega o acervo.">
                     <span class="period-icon-label">Período</span>
                     <select class="date-mode"><option value="any">Qualquer data</option><option value="days" selected>Últimos N dias</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select>
@@ -7258,7 +7025,7 @@
                             </div>
                         </div>
                         <p class="settings-section-label" style="margin-top:16px">GSEs padrão</p>
-                        <p class="settings-hint">Ficam marcadas toda vez que você abrir a pesquisa. Dá pra desmarcar ou adicionar outras pontualmente em cada busca (inclusive pela busca de "Outras GSEs") sem afetar essa configuração — e valem pras 3 abas (Termos, Semelhança e Estatística), que compartilham a mesma seleção.</p>
+                        <p class="settings-hint">Ficam marcadas toda vez que você abrir a pesquisa. Dá pra desmarcar ou adicionar outras pontualmente em cada busca (inclusive pela busca de "Outras GSEs") sem afetar essa configuração — e valem pras 2 abas (Termos e Estatística), que compartilham a mesma seleção.</p>
                         <div class="combo" id="settingsGseCombo">
                             <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar GSEs...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
                             <div class="combo-panel">
@@ -7324,7 +7091,6 @@
             indexTrack: shadow.querySelector(".index-track"), indexFill: shadow.querySelector(".index-fill"), indexReset: shadow.querySelector(".index-reset"),
             indexMeasure: shadow.querySelector(".index-measure"), indexReport: shadow.querySelector(".index-report"),
             query: shadow.querySelector(".query"), search: shadow.querySelector(".search"), queryValidator: shadow.querySelector(".query-validator"),
-            semanticQuery: shadow.querySelector(".semantic-query"), semanticSearch: shadow.querySelector(".semantic-search"), semanticLimit: shadow.querySelector(".semantic-limit"),
             fieldDescription: shadow.querySelector(".field-description"), fieldSolution: shadow.querySelector(".field-solution"), fieldDiscussion: shadow.querySelector(".field-discussion"),
             mode: shadow.querySelector(".mode"), sortSelect: shadow.querySelector(".sort-select"), fieldChecks: shadow.querySelector(".field-checks"),
             loadButton: shadow.querySelector(".load"), cancelLoad: shadow.querySelector(".cancel-load"), cancelSearch: shadow.querySelector(".cancel-search"),
@@ -7643,11 +7409,9 @@
         ui.query.addEventListener("blur", renderQueryValidator);
         ui.query.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); if (renderQueryValidator()) performSearch(); } });
         ui.mode.addEventListener("change", renderQueryValidator);
-        // Alternância de modo (termos/semelhança) agora é 100% CSS — os dois
-        // radios ocultos (#tjspModeTerms/#tjspModeSimilar/#tjspModeStats)
-        // controlam visibilidade e o estado marcado dos botões via seletor de
-        // irmão (~), sem JS.
-        ui.semanticSearch.addEventListener("click", performSemanticSearch);
+        // Alternância de modo agora é 100% CSS — os radios ocultos
+        // (#tjspModeTerms/#tjspModeStats) controlam visibilidade e o estado
+        // marcado dos botões via seletor de irmão (~), sem JS.
         ui.statsSearch.addEventListener("click", performStatsSearch);
         try { const savedView = localStorage.getItem(STATS_VIEW_STORAGE_KEY); if (savedView === "grid" || savedView === "table") statsViewMode = savedView; } catch (_) {}
         ui.statsViewToggle.querySelectorAll(".view-btn").forEach(btn => {
@@ -7698,10 +7462,10 @@
             // Buscar sem GSE só existe aqui: as outras abas fazem busca textual,
             // que depende do acervo indexado — e indexar é ancorado em GSE.
             ui.ignoreGseWrap.hidden = false;
-            // "Mais ocorrências"/"Mais semelhantes" só existem quando há
-            // texto pesquisado — a Estatística não busca texto nenhum.
+            // "Mais ocorrências" só existe quando há texto pesquisado — a
+            // Estatística não busca texto nenhum.
             shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = true; });
-            if (sortMode === "relevance" || sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
+            if (sortMode === "relevance") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
         }
         function restoreFromStats() {
             statsRelocatable.forEach(id => {
@@ -7724,7 +7488,6 @@
         }
         shadow.querySelector("#tjspModeStats").addEventListener("change", () => { if (shadow.querySelector("#tjspModeStats").checked) { moveIntoStats(); enterResultsBucket("stats"); } });
         shadow.querySelector("#tjspModeTerms").addEventListener("change", () => { if (shadow.querySelector("#tjspModeTerms").checked) { restoreFromStats(); enterResultsBucket("text"); } });
-        shadow.querySelector("#tjspModeSimilar").addEventListener("change", () => { if (shadow.querySelector("#tjspModeSimilar").checked) { restoreFromStats(); enterResultsBucket("text"); } });
         shadow.querySelectorAll(".stats-tag").forEach(tag => {
             tag.addEventListener("click", () => {
                 const slot = shadow.getElementById(tag.dataset.slot);
@@ -7732,9 +7495,6 @@
                 slot.hidden = !willShow;
                 tag.classList.toggle("active", willShow);
             });
-        });
-        ui.semanticQuery.addEventListener("keydown", event => {
-            if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !ui.semanticSearch.disabled) { event.preventDefault(); performSemanticSearch(); }
         });
         ui.sortSelect.addEventListener("change", () => { sortMode = ui.sortSelect.value; applySort(); currentPage = 1; renderResults(); });
         ui.prevPage.addEventListener("click", () => { currentPage--; renderResults(); });
