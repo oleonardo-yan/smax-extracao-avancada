@@ -3148,13 +3148,13 @@
     // { valid: true/false/null (null = campo vazio, estado neutro), message }
     function validateQuerySyntax(query, mode) {
         const trimmed = query.trim();
-        if (!trimmed) return { valid: null, message: "Digite um termo ou expressão pra ver como a busca será interpretada." };
+        if (!trimmed) return { valid: null, message: "Sem termo: será um levantamento só pelos filtros (GSE, status, período...). Digite um termo/expressão para também filtrar por texto." };
         if (mode === "exact") return { valid: true, message: `Pesquisará a expressão exata “${trimmed.replace(/^"|"$/g, "")}”.` };
         const quoteCount = (query.match(/"/g) || []).length;
         if (quoteCount % 2 !== 0) return { valid: false, message: 'Existem aspas abertas e não fechadas — falta uma aspa (") pra fechar a expressão exata.' };
         try {
             const tokens = tokenize(query, "OR");
-            if (!tokens.length) return { valid: null, message: "Digite um termo ou expressão pra ver como a busca será interpretada." };
+            if (!tokens.length) return { valid: null, message: "Sem termo: será um levantamento só pelos filtros (GSE, status, período...). Digite um termo/expressão para também filtrar por texto." };
             const ast = parseQueryExpression(tokens);
             const message = ast.type === "NOT"
                 ? `Pesquisará solicitações que NÃO contenham ${describeQueryExpression(ast.value, true)}.`
@@ -3915,6 +3915,7 @@
         currentPage = 1;
         applySort();
         activeIndex = results.length ? 0 : -1;
+        renderStats(results);
         const discussionWarning = prepared.searchDiscussion && !archiveIncludesDiscussion
             ? ' ⚠ Discussão não foi incluída — o acervo carregado não tem esse campo. Marque "Discussão" ANTES de clicar em "Pesquisar" e recarregue.'
             : "";
@@ -3939,6 +3940,7 @@
         currentPage = 1;
         applySort();
         activeIndex = results.length ? 0 : -1;
+        renderStats(results);
         const discussionWarning = searchDiscussion && !archiveIncludesDiscussion
             ? ' ⚠ Discussão não foi incluída — o acervo carregado não tem esse campo. Marque "Discussão" ANTES de clicar em "Pesquisar" e recarregue.'
             : "";
@@ -3982,6 +3984,7 @@
         currentPage = 1;
         applySort();
         activeIndex = results.length ? 0 : -1;
+        renderStats(results);
         const verb = exclude ? "NÃO passaram por nenhuma das" : "passaram por alguma das";
         setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) ${verb} GSEs filtradas (de ${before.toLocaleString("pt-BR")} antes do filtro de histórico).`, results.length ? "success" : "warning");
         focusedIndex = -1;
@@ -3992,6 +3995,21 @@
     async function performSearch() {
         userEngagedWithResults = false;
         try {
+            // Termo é OPCIONAL nesta ferramenta de extração: sem termo, a busca
+            // é um levantamento só por filtros estruturados (mesmo caminho da
+            // antiga Busca Estatística). Com termo, aplica também o matcher de
+            // texto por cima dos mesmos filtros. Em ambos os casos os filtros
+            // estruturados (advancedFiltersMatch) valem — quem decide é só se
+            // há ou não texto a casar.
+            const hasTerm = ui.query.value.trim() !== "";
+            if (!hasTerm) {
+                searchMode = "stats";
+                await ensureArchiveLoaded(() => applyStatsFilter(true));
+                if (!archive.length) return;
+                applyStatsFilter(false);
+                await maybeApplyHistoryGseFilter();
+                return;
+            }
             searchMode = "terms";
             const prepared = prepareTermSearch();
             await forceReloadIfDiscussionMissing();
@@ -4016,6 +4034,7 @@
         currentPage = 1;
         applySort();
         activeIndex = results.length ? 0 : -1;
+        renderStats(results);
         const partialNote = isPartial ? " (carregando o restante em segundo plano...)" : "";
         setStatus(`${results.length.toLocaleString("pt-BR")} solicitação(ões) com esses filtros, em ${archive.length.toLocaleString("pt-BR")} carregadas${partialNote}.`, results.length ? "success" : "warning");
         if (userEngagedWithResults) { syncFocusCounters(); return; }
@@ -4101,19 +4120,28 @@
     // ============================================================
     // ESTATÍSTICAS DO ACERVO CARREGADO
     // ============================================================
-    function renderStats() {
-        if (!archive.length) { ui.statsStrip.hidden = true; return; }
+    // Agrega e mostra a tira de contagens. Recebe o CONJUNTO a agregar —
+    // por padrão o resultado da busca atual (foco em dados), caindo para o
+    // acervo inteiro só quando ainda não houve busca (logo após a carga).
+    // A quebra por GSE é o padrão; a alternância por Status/Unidade entra
+    // com o painel de contagens completo (etapa de layout).
+    function renderStats(dataset) {
+        const isResult = dataset !== undefined;
+        const data = isResult ? dataset : archive;
+        if (!data || !data.length) { ui.statsStrip.hidden = true; return; }
         ui.statsStrip.hidden = false;
         const byGse = new Map();
         let newest = -Infinity, oldest = Infinity;
-        archive.forEach(item => {
+        data.forEach(item => {
             byGse.set(item.groupName, (byGse.get(item.groupName) || 0) + 1);
             const created = Number(item.created);
             if (Number.isFinite(created)) { if (created > newest) newest = created; if (created < oldest) oldest = created; }
         });
         const ranked = Array.from(byGse.entries()).sort((a, b) => b[1] - a[1]);
         const maxCount = ranked.length ? ranked[0][1] : 1;
-        ui.statsCount.textContent = `${archive.length.toLocaleString("pt-BR")} solicitações`;
+        ui.statsCount.textContent = isResult
+            ? `${data.length.toLocaleString("pt-BR")} no resultado`
+            : `${data.length.toLocaleString("pt-BR")} solicitações`;
         ui.statsLoadedAt.textContent = archiveLoadedAt ? `carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}` : "";
         ui.statsRange.textContent = Number.isFinite(oldest) && Number.isFinite(newest)
             ? `de ${formatDate(oldest)} até ${formatDate(newest)}`
@@ -6743,7 +6771,7 @@
                 </div>
                 <div class="terms-mode">
                     <div class="query-row">
-                        <div class="query-wrap"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg><input class="query" type="text" placeholder='Ex.: "erro ao assinar" E eproc -certificado'></div>
+                        <div class="query-wrap"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg><input class="query" type="text" placeholder='Termo opcional — deixe vazio para levantar só por filtros. Ex.: "erro ao assinar" E eproc -certificado'></div>
                         <button class="search" type="button"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>Pesquisar no acervo</button>
                     </div>
                     <div class="operators-row"><span class="operators-label">Inserir:</span>
