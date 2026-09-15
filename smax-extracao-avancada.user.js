@@ -3370,9 +3370,17 @@
     // passou por nenhuma delas. Item sem histórico conhecido (nunca buscado
     // com sucesso) conta como "não passou", nos dois modos — é o mesmo
     // padrão seguro de antes, só espelhado pro modo excludente.
-    async function applyHistoryGseFilter(items, targetGseIds, exclude) {
-        if (!targetGseIds.length) return items;
-        const targetSet = new Set(targetGseIds);
+    // requiredGseIds: GSEs da condição "Passou por", combinadas conforme
+    // requiredMode ("all" = precisa ter passado por TODAS; "any" = basta
+    // qualquer uma). excludeGseIds: não pode ter passado por NENHUMA destas
+    // (sempre E/NOR — excluir "qualquer uma" ou "todas" dá no mesmo quando o
+    // que se quer é "nenhuma delas"). Os dois juntos cobrem "passou por A e
+    // por B", "passou por A ou por B" e "passou por A mas não por B" — que era
+    // o que o Filtro por Lista fazia e aqui só dava pra pedir uma coisa ou
+    // outra. O histórico é consultado UMA vez por chamado e fica em
+    // `_historyGses`, então combinar critérios não multiplica chamadas à rede.
+    async function applyHistoryGseFilter(items, requiredGseIds, requiredMode, excludeGseIds) {
+        if (!requiredGseIds.length && !excludeGseIds.length) return items;
         const needsFetch = items.filter(item => !item._historyGses);
         if (needsFetch.length && ui.historyGseProgress) {
             ui.historyGseProgress.hidden = false;
@@ -3392,10 +3400,15 @@
         }
         if (ui.historyGseProgress) ui.historyGseProgress.hidden = true;
         return items.filter(item => {
-            const gses = item._historyGses;
-            let passedThrough = false;
-            if (gses && gses.size) { for (const id of targetSet) { if (gses.has(id)) { passedThrough = true; break; } } }
-            return exclude ? !passedThrough : passedThrough;
+            const gses = item._historyGses || new Set();
+            if (requiredGseIds.length) {
+                const passes = requiredMode === "any"
+                    ? requiredGseIds.some(id => gses.has(id))
+                    : requiredGseIds.every(id => gses.has(id));
+                if (!passes) return false;
+            }
+            for (const id of excludeGseIds) { if (gses.has(id)) return false; }
+            return true;
         });
     }
 
@@ -4162,19 +4175,44 @@
         renderResults();
     }
 
+    // Modo do primeiro combo de "Passou por GSE" — "all" (E) é o padrão, como
+    // no Filtro por Lista: marcar duas GSEs querendo "passou pelas duas" é o
+    // pedido mais comum, e o OU continua a um clique.
+    function historyRequiredMode() {
+        if (!host || !host.shadowRoot) return "all";
+        const picked = host.shadowRoot.querySelector(".history-mode:checked");
+        return picked ? picked.value : "all";
+    }
+
+    // GSE que está em "passou por" e em "não pode ter passado por" ao mesmo
+    // tempo zeraria o resultado sem explicar por quê.
+    function historyGseProblem() {
+        if (!ui.historyGseCombo || !ui.historyGseExcludeCombo) return null;
+        const required = ui.historyGseCombo.getSelected().map(o => o.value);
+        const excluded = ui.historyGseExcludeCombo.getSelected();
+        const overlap = excluded.filter(o => required.includes(o.value));
+        if (!overlap.length) return null;
+        return `A mesma GSE não pode estar em "Passou por" e em "não pode ter passado por": ${overlap.map(o => o.label).join(", ")}.`;
+    }
+
     async function maybeApplyHistoryGseFilter() {
         if (!ui.historyGseCombo) return;
-        const selected = ui.historyGseCombo.getSelected();
-        if (!selected.length) return;
-        const exclude = !!(ui.historyGseExclude && ui.historyGseExclude.checked);
+        const required = ui.historyGseCombo.getSelected();
+        const excluded = ui.historyGseExcludeCombo ? ui.historyGseExcludeCombo.getSelected() : [];
+        if (!required.length && !excluded.length) return;
+        const mode = historyRequiredMode();
         const before = results.length;
-        results = await applyHistoryGseFilter(results, selected.map(o => o.value), exclude);
+        results = await applyHistoryGseFilter(results, required.map(o => o.value), mode, excluded.map(o => o.value));
         currentPage = 1;
         applySort();
         activeIndex = results.length ? 0 : -1;
         renderStats(results);
-        const verb = exclude ? "NÃO passaram por nenhuma das" : "passaram por alguma das";
-        setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) ${verb} GSEs filtradas (de ${before.toLocaleString("pt-BR")} antes do filtro de histórico).`, results.length ? "success" : "warning");
+        const parts = [];
+        if (required.length) parts.push(required.length > 1
+            ? (mode === "any" ? "passaram por ALGUMA das GSEs exigidas" : "passaram por TODAS as GSEs exigidas")
+            : "passaram pela GSE exigida");
+        if (excluded.length) parts.push("não passaram por nenhuma das GSEs excluídas");
+        setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) que ${parts.join(" e ")} (de ${before.toLocaleString("pt-BR")} antes do filtro de histórico).`, results.length ? "success" : "warning");
         focusedIndex = -1;
         if (ui.focusOverlay) ui.focusOverlay.hidden = true;
         renderResults();
@@ -4194,7 +4232,7 @@
             // texto por cima dos mesmos filtros. Em ambos os casos os filtros
             // estruturados (advancedFiltersMatch) valem — quem decide é só se
             // há ou não texto a casar.
-            const triageError = triageProblem();
+            const triageError = triageProblem() || historyGseProblem();
             if (triageError) { setStatus(triageError, "error"); return; }
             const hasTerm = ui.query.value.trim() !== "";
             if (!hasTerm) {
@@ -5275,8 +5313,12 @@
         if (triageRowTerms.include.length) rows.push({ label: `Triagem — deve conter (em ${triageRowFields.join("/") || "nenhum campo marcado"})`, items: triageRowTerms.include });
         if (triageRowTerms.exclude.length) rows.push({ label: `Triagem — não pode conter (em ${triageRowFields.join("/") || "nenhum campo marcado"})`, items: triageRowTerms.exclude });
         if (ui.historyGseCombo && ui.historyGseCombo.getSelected().length) {
-            const excludeLabel = ui.historyGseExclude && ui.historyGseExclude.checked ? "Não passou por GSE" : "Passou por GSE";
-            rows.push({ label: excludeLabel, items: ui.historyGseCombo.getSelected().map(o => o.label) });
+            const selected = ui.historyGseCombo.getSelected();
+            const modeLabel = selected.length > 1 ? (historyRequiredMode() === "any" ? " (qualquer uma)" : " (todas)") : "";
+            rows.push({ label: `Passou por GSE${modeLabel}`, items: selected.map(o => o.label) });
+        }
+        if (ui.historyGseExcludeCombo && ui.historyGseExcludeCombo.getSelected().length) {
+            rows.push({ label: "Não passou por GSE", items: ui.historyGseExcludeCombo.getSelected().map(o => o.label) });
         }
         return rows;
     }
@@ -6313,6 +6355,35 @@
     // Abre (e marca ativa) a tag de um filtro opcional só quando a preferência
     // aplicada de fato trouxe algo pra ele — senão o campo fica preenchido
     // mas escondido atrás da tag, parecendo que "não aplicou nada".
+    const FILTER_TAG_SOURCES = {
+        statsStatusSlot: () => ["statusCombo", "statusOperacionalCombo"],
+        statsUnidadeSlot: () => ["unidadeCombo", "unidadeExcludeCombo"],
+        statsSolicitadoSlot: () => ["requestedForCombo", "requestedForExcludeCombo"],
+        statsEspecialistaSlot: () => ["specialistCombo", "specialistExcludeCombo"]
+    };
+
+    function refreshFilterTagBadges() {
+        if (!host || !host.shadowRoot) return;
+        Object.keys(FILTER_TAG_SOURCES).forEach(slotId => {
+            const tag = host.shadowRoot.querySelector(`.stats-tag[data-slot="${slotId}"]`);
+            if (!tag) return;
+            const total = FILTER_TAG_SOURCES[slotId]().reduce((sum, key) => {
+                const combo = ui[key];
+                return sum + (combo && combo.getSelected ? combo.getSelected().length : 0);
+            }, 0);
+            tag.classList.toggle("filled", total > 0);
+            let badge = tag.querySelector(".stats-tag-count");
+            if (!total) { if (badge) badge.remove(); return; }
+            if (!badge) {
+                badge = document.createElement("span");
+                badge.className = "stats-tag-count";
+                tag.appendChild(badge);
+            }
+            badge.textContent = String(total);
+            tag.title = "Este filtro está com valor marcado — ele vale mesmo com o campo fechado.";
+        });
+    }
+
     function openStatsTagIfFilled(slotId, hasValue) {
         if (!hasValue) return;
         const shadow = host.shadowRoot;
@@ -6320,6 +6391,7 @@
         const tag = shadow.querySelector(`.stats-tag[data-slot="${slotId}"]`);
         if (slot) slot.hidden = false;
         if (tag) tag.classList.add("active");
+        refreshFilterTagBadges();
     }
 
     // specialistPersonId/requestedForPersonId (valor único) são o formato
@@ -6352,10 +6424,10 @@
             const wanted = new Set(filters.triageFields);
             host.shadowRoot.querySelectorAll(".triage-field").forEach(input => { input.checked = wanted.has(input.value); });
         }
-        // Pessoas (Especialista/Solicitado) agora vivem em "Filtros avançados",
-        // não mais como tags nesta área — só Status/Unidade têm tag pra abrir.
         openStatsTagIfFilled("statsStatusSlot", (filters.statusValues && filters.statusValues.length) || (filters.statusOperacionalValues && filters.statusOperacionalValues.length));
-        openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeValues && filters.unidadeValues.length);
+        openStatsTagIfFilled("statsUnidadeSlot", (filters.unidadeValues && filters.unidadeValues.length) || (filters.unidadeExcludeValues && filters.unidadeExcludeValues.length));
+        openStatsTagIfFilled("statsSolicitadoSlot", (requestedForIds && requestedForIds.length) || (filters.requestedForExcludeIds && filters.requestedForExcludeIds.length));
+        openStatsTagIfFilled("statsEspecialistaSlot", (specialistIds && specialistIds.length) || (filters.specialistExcludeIds && filters.specialistExcludeIds.length));
     }
 
     function findPreference(id) { return statsPreferences.find(pref => pref.id === id); }
@@ -6791,6 +6863,14 @@
             .stats-tag { height: 30px; padding: 0 13px; border-radius: 99px; border: 1.5px solid var(--v-accent); color: var(--v-accent); background: var(--v-panel); font-size: 12px; font-weight: 700; cursor: pointer; }
             .stats-tag.active { background: var(--v-accent); color: #fff; border-color: transparent; }
             .stats-tag-fields { display: flex; flex-wrap: wrap; gap: 14px; }
+            .stats-tag-slot .person-control { flex: 1; min-width: 230px; }
+            .stats-tag.filled { border-color: var(--v-accent); color: var(--v-accent); font-weight: 700; }
+            .stats-tag.active .stats-tag-count { background: #fff; color: var(--v-accent); }
+            .stats-tag-count { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; margin-left: 6px; padding: 0 4px; border-radius: 99px; background: var(--v-accent); color: #fff; font-size: 10px; font-weight: 800; }
+
+            .history-mode-row { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 8px; }
+            .history-mode-row .option-inline { font-size: 11.5px; }
+
             .gse-surface { margin-top: 12px; }
             .gse-surface .panel { padding: 11px 13px; }
             .gse-surface .gse-list { max-height: 104px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
@@ -6933,7 +7013,6 @@
             .control { position: relative; }
             .control label:not(.option) { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
             .control input, .control select { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; }
-            .people-grid { display: grid; gap: 10px; }
             .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
             .option-list { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--v-panel-border); }
             .option { display: grid; grid-template-columns: 16px 1fr; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
@@ -7381,10 +7460,12 @@
                             <button type="button" class="prefs-import-btn pref-action">⬇ Importar</button>
                         </div>
                     </div>
-                    <p class="stats-tag-title">Filtros de classificação</p>
+                    <p class="stats-tag-title">Filtros (clique para adicionar)</p>
                     <div class="stats-tag-row">
                         <button type="button" class="stats-tag" data-slot="statsStatusSlot">+ Status</button>
                         <button type="button" class="stats-tag" data-slot="statsUnidadeSlot">+ Unidade/Comarca</button>
+                        <button type="button" class="stats-tag" data-slot="statsSolicitadoSlot">+ Solicitado para</button>
+                        <button type="button" class="stats-tag" data-slot="statsEspecialistaSlot">+ Designado Especialista</button>
                     </div>
                     <div class="stats-tag-fields">
                         <div class="stats-tag-slot" id="statsStatusSlot" hidden>
@@ -7409,6 +7490,42 @@
                                         <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+                        <div class="stats-tag-slot" id="statsSolicitadoSlot" hidden>
+                            <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label>
+                                <div class="person-multi" id="requestedForCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
+                            </div>
+                            <div class="control person-control" id="filterRequestedForExcludeControl"><label>Solicitado para — <span class="excl-tag">excluir</span></label>
+                                <div class="person-multi" id="requestedForExcludeCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
+                            </div>
+                        </div>
+                        <div class="stats-tag-slot" id="statsEspecialistaSlot" hidden>
+                            <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label>
+                                <div class="person-multi" id="specialistCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
+                            </div>
+                            <div class="control person-control" id="filterSpecialistExcludeControl"><label>Designado Especialista — <span class="excl-tag">excluir</span></label>
+                                <div class="person-multi" id="specialistExcludeCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
                             </div>
                         </div>
                         <div class="stats-tag-slot" id="statsUnidadeSlot" hidden><div class="control"><label>Unidade/Comarca</label>
@@ -7459,40 +7576,7 @@
                 <div class="advanced-toggle-wrap">
                     <button class="btn btn-secondary advanced-toggle" type="button" aria-expanded="false">Filtros avançados<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></button>
                     <div class="advanced-panel" hidden>
-                        <section class="panel" style="grid-column:1/-1"><h3>Pessoas</h3><div class="people-grid">
-                            <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label>
-                                <div class="person-multi" id="requestedForCombo">
-                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
-                                    <div class="specialist-menu" hidden></div>
-                                    <div class="person-chips"></div>
-                                </div>
-                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
-                            </div>
-                            <div class="control person-control" id="filterRequestedForExcludeControl"><label>Solicitado para — <span class="excl-tag">excluir</span></label>
-                                <div class="person-multi" id="requestedForExcludeCombo">
-                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
-                                    <div class="specialist-menu" hidden></div>
-                                    <div class="person-chips"></div>
-                                </div>
-                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
-                            </div>
-                            <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label>
-                                <div class="person-multi" id="specialistCombo">
-                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
-                                    <div class="specialist-menu" hidden></div>
-                                    <div class="person-chips"></div>
-                                </div>
-                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
-                            </div>
-                            <div class="control person-control" id="filterSpecialistExcludeControl"><label>Designado Especialista — <span class="excl-tag">excluir</span></label>
-                                <div class="person-multi" id="specialistExcludeCombo">
-                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
-                                    <div class="specialist-menu" hidden></div>
-                                    <div class="person-chips"></div>
-                                </div>
-                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
-                            </div>
-                        </div>
+                        <section class="panel" style="grid-column:1/-1"><h3>Selos e datas</h3>
                         <label class="option" style="margin-top:10px" id="filterVipControl"><input class="vip-only" type="checkbox"><span>Usuário VIP</span></label>
                         <label class="option" id="filterGlobalControl"><input class="global-only" type="checkbox"><span>Global</span></label>
                         <div style="margin-top:14px">
@@ -7523,7 +7607,7 @@
                             <div class="triage-actions"><button type="button" class="tiny triage-clear">Limpar triagem</button><small class="person-hint">Vale também ao refinar um recorte congelado.</small></div>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Passou por GSE</h3>
-                            <small class="person-hint">Mostrar somente solicitações que passaram por estas GSEs (consulta o histórico de cada uma).</small>
+                            <small class="person-hint">Filtra pelo histórico de cada solicitação: por onde ela passou, não só onde está agora.</small>
                             <div class="control" style="margin-top:8px">
                                 <p class="stats-tag-title team-pills-title" id="historyTeamsTitle" hidden>Minhas equipes</p>
                                 <div class="team-pills" id="historyTeams"></div>
@@ -7537,8 +7621,23 @@
                                         <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
                                     </div>
                                 </div>
-                                <label class="option history-gse-exclude-wrap"><input class="history-gse-exclude" type="checkbox"><span>Excludente — mostrar só quem NÃO passou por nenhuma das GSEs marcadas</span></label>
-                                <small class="person-hint history-gse-hint">Lógica OU — basta ter passado por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos).</small>
+                                <div class="history-mode-row">
+                                    <label class="option-inline"><input type="radio" name="historyMode" class="history-mode" value="all" checked><span>Precisa ter passado por TODAS (E)</span></label>
+                                    <label class="option-inline"><input type="radio" name="historyMode" class="history-mode" value="any"><span>Basta ter passado por QUALQUER UMA (OU)</span></label>
+                                </div>
+                            </div>
+                            <div class="control" style="margin-top:12px">
+                                <label>E não pode ter passado por NENHUMA destas</label>
+                                <div class="combo" id="historyGseExcludeCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Nenhuma GSE selecionada</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Ex.: sti, gmud, aciv..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                                <small class="person-hint history-gse-hint">Combine os dois: E ou OU no primeiro combo (com mais de uma GSE marcada), e/ou o segundo para excluir quem passou por certas GSEs — por exemplo, "passou por A mas não por B". Consulta o histórico de cada solicitação, então pode levar alguns segundos.</small>
                             </div>
                             <div class="history-gse-progress" hidden><span class="history-gse-progress-text"></span></div>
                         </section>
@@ -7773,7 +7872,7 @@
             solutionDateMode: shadow.querySelector(".solution-date-mode"), solutionDateFrom: shadow.querySelector(".solution-date-from"), solutionDateTo: shadow.querySelector(".solution-date-to"), solutionDateDays: shadow.querySelector(".solution-date-days"),
             solutionDateFromWrap: shadow.querySelector(".solution-date-from-wrap"), solutionDateToWrap: shadow.querySelector(".solution-date-to-wrap"), solutionDateDaysWrap: shadow.querySelector(".solution-date-days-wrap"), solutionDateFromLabel: shadow.querySelector(".solution-date-from-label"), solutionDateToLabel: shadow.querySelector(".solution-date-to-label"),
             gseList: shadow.querySelector(".gse-list"), gseTeams: shadow.getElementById("gseTeams"), gseTeamsTitle: shadow.getElementById("gseTeamsTitle"), ignoreGse: shadow.querySelector(".ignore-gse"), ignoreGseWrap: shadow.querySelector(".ignore-gse-wrap"), extraGseComboRoot: shadow.getElementById("extraGseCombo"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
-            historyGseComboRoot: shadow.getElementById("historyGseCombo"), historyGseProgress: shadow.querySelector(".history-gse-progress"), historyGseProgressText: shadow.querySelector(".history-gse-progress-text"), historyTeams: shadow.getElementById("historyTeams"), historyTeamsTitle: shadow.getElementById("historyTeamsTitle"), historyTeamsHint: shadow.getElementById("historyTeamsHint"), historyGseExclude: shadow.querySelector(".history-gse-exclude"), historyGseHint: shadow.querySelector(".history-gse-hint"),
+            historyGseComboRoot: shadow.getElementById("historyGseCombo"), historyGseProgress: shadow.querySelector(".history-gse-progress"), historyGseProgressText: shadow.querySelector(".history-gse-progress-text"), historyTeams: shadow.getElementById("historyTeams"), historyTeamsTitle: shadow.getElementById("historyTeamsTitle"), historyTeamsHint: shadow.getElementById("historyTeamsHint"), historyGseExcludeComboRoot: shadow.getElementById("historyGseExcludeCombo"), historyGseHint: shadow.querySelector(".history-gse-hint"),
             freezeButton: shadow.querySelector(".freeze-result"), freezeLabel: shadow.querySelector(".freeze-label"),
             snapshotPanel: shadow.querySelector(".snapshot-panel"), snapshotTableBody: shadow.querySelector(".snapshot-tbody"),
             refinePanel: shadow.querySelector(".refine-panel"), refineBaseSelect: shadow.querySelector(".refine-base-select"),
@@ -8307,15 +8406,11 @@
         // GSEs individuais continuam ajustáveis normalmente no combo.
         renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo);
         ui.historyGseCombo.onChange(() => renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo));
-        if (ui.historyGseExclude && ui.historyGseHint) {
-            const updateHistoryGseHint = () => {
-                ui.historyGseHint.textContent = ui.historyGseExclude.checked
-                    ? "Excludente — fora quem passou por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos)."
-                    : "Lógica OU — basta ter passado por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos).";
-            };
-            ui.historyGseExclude.addEventListener("change", updateHistoryGseHint);
-            updateHistoryGseHint();
-        }
+        ui.historyGseExcludeCombo = installGseCombobox(ui.historyGseExcludeComboRoot, shadow);
+        ["statusCombo", "statusOperacionalCombo", "unidadeCombo", "unidadeExcludeCombo",
+         "requestedForCombo", "requestedForExcludeCombo", "specialistCombo", "specialistExcludeCombo"]
+            .forEach(key => { if (ui[key] && ui[key].onChange) ui[key].onChange(refreshFilterTagBadges); });
+        refreshFilterTagBadges();
     }
 
     // Ao abrir a página, avisa se já existe acervo salvo em disco de sessões
