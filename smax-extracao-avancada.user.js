@@ -159,6 +159,7 @@
             { id: "61730998", name: "GSE - SGS - EPROC - CONFIG" }
         ] }
     ];
+    const CRITERIA_SHARE_PREFIX = "TJSP-CRIT1:"; // marca o código de critérios de busca (copiar/colar) e sua versão de formato
     const PREFS_SHARE_PREFIX = "TJSP-PREF1:"; // marca o código de compartilhamento (copiar/colar) e sua versão de formato
     const PREFS_VISIBLE_FAVORITES = 3; // só as favoritas viram chip fixo — o resto fica em "Ver todas"
 
@@ -4940,6 +4941,186 @@
     }
 
     // ============================================================
+    // COPIAR / IMPORTAR CRITÉRIOS DE BUSCA
+    // ============================================================
+    // O texto copiado serve para DUAS coisas ao mesmo tempo: ser lido (anotado
+    // junto do levantamento, para daqui a meses ainda se saber como aquele
+    // número foi produzido) e ser colado de volta aqui para refazer a busca.
+    // Por isso ele é um resumo legível seguido de um código — e a importação
+    // procura o código DENTRO do texto colado, então dá para colar a anotação
+    // inteira, com comentários e tudo, sem precisar isolar nada.
+    function comboSelection(key) {
+        const combo = ui[key];
+        return combo && combo.getSelected ? combo.getSelected() : [];
+    }
+
+    function captureSearchCriteria() {
+        return {
+            v: 1,
+            term: ui.query.value,
+            mode: ui.mode.value,
+            fields: { description: ui.fieldDescription.checked, solution: ui.fieldSolution.checked, discussion: ui.fieldDiscussion.checked },
+            sort: ui.sortSelect.value,
+            ignoreGse: !!(ui.ignoreGse && ui.ignoreGse.checked),
+            // Nome junto do Id: uma GSE que não esteja na lista local de quem
+            // importa entraria como um código cru sem isso.
+            gses: selectedGseIds().map(id => ({ id, name: GSE_NAME[id] || id })),
+            date: { mode: ui.dateMode.value, days: ui.dateDays.value, from: ui.dateFrom.value, to: ui.dateTo.value },
+            solutionDate: { mode: ui.solutionDateMode.value, days: ui.solutionDateDays.value, from: ui.solutionDateFrom.value, to: ui.solutionDateTo.value },
+            status: comboSelection("statusCombo"),
+            statusOperacional: comboSelection("statusOperacionalCombo"),
+            unidade: comboSelection("unidadeCombo"),
+            unidadeExclude: comboSelection("unidadeExcludeCombo"),
+            requestedFor: comboSelection("requestedForCombo"),
+            requestedForExclude: comboSelection("requestedForExcludeCombo"),
+            specialist: comboSelection("specialistCombo"),
+            specialistExclude: comboSelection("specialistExcludeCombo"),
+            vip: ui.vipOnly.checked,
+            global: !!(ui.globalOnly && ui.globalOnly.checked),
+            ignoreCase: ui.ignoreCase.checked,
+            ignoreAccents: ui.ignoreAccents.checked,
+            triage: { fields: triageFields(), include: ui.triageInclude.value, exclude: ui.triageExclude.value },
+            history: { required: comboSelection("historyGseCombo"), mode: historyRequiredMode(), exclude: comboSelection("historyGseExcludeCombo") }
+        };
+    }
+
+    function setCombo(key, list) {
+        const combo = ui[key];
+        if (combo && combo.setSelected) combo.setSelected(Array.isArray(list) ? list : []);
+    }
+
+    function applySearchCriteria(data) {
+        if (!data || typeof data !== "object") throw new Error("Código de critérios inválido.");
+        ui.query.value = data.term || "";
+        if (data.mode) ui.mode.value = data.mode;
+        if (data.fields) {
+            ui.fieldDescription.checked = data.fields.description !== false;
+            ui.fieldSolution.checked = data.fields.solution !== false;
+            ui.fieldDiscussion.checked = !!data.fields.discussion;
+        }
+        if (data.sort) { ui.sortSelect.value = data.sort; sortMode = data.sort; }
+        if (ui.ignoreGse) ui.ignoreGse.checked = !!data.ignoreGse;
+
+        // GSEs: as que existem na lista local são marcadas ali; as outras vão
+        // para "Outras GSEs" com o nome que veio no código, senão apareceriam
+        // como um Id cru para quem não tem aquela GSE configurada.
+        const gses = Array.isArray(data.gses) ? data.gses : [];
+        const wanted = new Set(gses.map(entry => String(entry.id)));
+        gses.forEach(entry => { if (entry && entry.id && entry.name) GSE_NAME[String(entry.id)] = entry.name; });
+        const local = new Set();
+        ui.gseList.querySelectorAll("input[data-gse]").forEach(input => {
+            input.checked = wanted.has(String(input.value));
+            local.add(String(input.value));
+        });
+        if (ui.extraGseCombo) {
+            ui.extraGseCombo.setSelected(gses
+                .filter(entry => entry && entry.id && !local.has(String(entry.id)))
+                .map(entry => ({ value: String(entry.id), label: entry.name || String(entry.id) })));
+        }
+
+        const date = data.date || {};
+        ui.dateMode.value = date.mode || "any";
+        ui.dateDays.value = date.days || "";
+        ui.dateFrom.value = date.from || "";
+        ui.dateTo.value = date.to || "";
+        updateDateControls();
+
+        const solution = data.solutionDate || {};
+        ui.solutionDateMode.value = solution.mode || "any";
+        ui.solutionDateDays.value = solution.days || "";
+        ui.solutionDateFrom.value = solution.from || "";
+        ui.solutionDateTo.value = solution.to || "";
+        updateSolutionDateControls();
+
+        setCombo("statusCombo", data.status);
+        setCombo("statusOperacionalCombo", data.statusOperacional);
+        setCombo("unidadeCombo", data.unidade);
+        setCombo("unidadeExcludeCombo", data.unidadeExclude);
+        setCombo("requestedForCombo", data.requestedFor);
+        setCombo("requestedForExcludeCombo", data.requestedForExclude);
+        setCombo("specialistCombo", data.specialist);
+        setCombo("specialistExcludeCombo", data.specialistExclude);
+        setCombo("historyGseCombo", data.history && data.history.required);
+        setCombo("historyGseExcludeCombo", data.history && data.history.exclude);
+
+        ui.vipOnly.checked = !!data.vip;
+        if (ui.globalOnly) ui.globalOnly.checked = !!data.global;
+        ui.ignoreCase.checked = data.ignoreCase !== false;
+        ui.ignoreAccents.checked = data.ignoreAccents !== false;
+
+        const triage = data.triage || {};
+        ui.triageInclude.value = triage.include || "";
+        ui.triageExclude.value = triage.exclude || "";
+        if (host && host.shadowRoot) {
+            const triageWanted = new Set(Array.isArray(triage.fields) ? triage.fields : ["description", "solution"]);
+            host.shadowRoot.querySelectorAll(".triage-field").forEach(input => { input.checked = triageWanted.has(input.value); });
+            const mode = (data.history && data.history.mode) || "all";
+            host.shadowRoot.querySelectorAll(".history-mode").forEach(input => { input.checked = input.value === mode; });
+        }
+
+        // Abre as tags que receberam valor: um critério importado que ficasse
+        // escondido atrás de uma tag fechada filtraria sem aparecer.
+        openStatsTagIfFilled("statsStatusSlot", (data.status || []).length || (data.statusOperacional || []).length);
+        openStatsTagIfFilled("statsUnidadeSlot", (data.unidade || []).length || (data.unidadeExclude || []).length);
+        openStatsTagIfFilled("statsSolicitadoSlot", (data.requestedFor || []).length || (data.requestedForExclude || []).length);
+        openStatsTagIfFilled("statsEspecialistaSlot", (data.specialist || []).length || (data.specialistExclude || []).length);
+        openStatsTagIfFilled("statsSolutionDateSlot", solution.mode && solution.mode !== "any");
+        openStatsTagIfFilled("statsTriagemSlot", String(triage.include || "").trim() || String(triage.exclude || "").trim());
+        openStatsTagIfFilled("statsHistoricoSlot", ((data.history && data.history.required) || []).length || ((data.history && data.history.exclude) || []).length);
+
+        if (gseListComboInstance) renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance);
+        if (ui.historyGseCombo) renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo);
+        refreshFilterTagBadges();
+        renderQueryValidator();
+        setCriteriaCollapsed(false, false);
+    }
+
+    function encodeCriteriaCode(data) {
+        try { return CRITERIA_SHARE_PREFIX + utf8ToBase64(JSON.stringify(data)); }
+        catch (_) { return ""; }
+    }
+
+    // Procura o código DENTRO do que foi colado: assim vale colar a anotação
+    // inteira, com títulos e comentários em volta.
+    function decodeCriteriaCode(text) {
+        const match = String(text || "").match(new RegExp(CRITERIA_SHARE_PREFIX.replace(/[-]/g, "\\$&") + "([A-Za-z0-9+/=]+)"));
+        if (!match) throw new Error(`Não encontrei um código de critérios no que foi colado (a linha que começa com ${CRITERIA_SHARE_PREFIX}).`);
+        const parsed = JSON.parse(base64ToUtf8(match[1]));
+        if (!parsed || typeof parsed !== "object") throw new Error("Código de critérios inválido.");
+        return parsed;
+    }
+
+    const SORT_LABELS = { recent: "Mais recentes", oldest: "Mais antigas", relevance: "Mais ocorrências" };
+
+    function criteriaClipboardText() {
+        const lines = [];
+        const term = ui.query.value.trim();
+        lines.push("EXTRAÇÃO AVANÇADA SMAX — critérios da busca");
+        lines.push(`Anotado em ${new Date().toLocaleString("pt-BR")}`);
+        lines.push("");
+        lines.push(`Termo: ${term || "(sem termo — levantamento só pelos filtros)"}`);
+        if (term) {
+            lines.push(`Modo do termo: ${ui.mode.value === "exact" ? "Expressão exata" : "Qualquer palavra"}`);
+            const fields = [ui.fieldDescription.checked ? "Descrição" : "", ui.fieldSolution.checked ? "Solução" : "", ui.fieldDiscussion.checked ? "Discussão" : ""].filter(Boolean);
+            lines.push(`Buscar em: ${fields.join(", ") || "(nenhum campo marcado)"}`);
+        }
+        if (ignoringGse()) lines.push("GSE: ignorada — consulta ao vivo, ancorada nos filtros abaixo");
+        buildFilterSummaryRows().forEach(row => lines.push(`${row.label}: ${row.items.join(", ")}`));
+        lines.push(`Ordenação: ${SORT_LABELS[ui.sortSelect.value] || ui.sortSelect.value}`);
+        if (lastCoverage) {
+            lines.push(lastCoverage.ok
+                ? `Cobertura da carga: conferida (${lastCoverage.expected.toLocaleString("pt-BR")} no SMAX)`
+                : lastCoverage.estimated
+                    ? `Cobertura da carga: estimada (SMAX ≥ ${lastCoverage.expected.toLocaleString("pt-BR")})`
+                    : `Cobertura da carga: INCOMPLETA — faltaram ${lastCoverage.deficit.toLocaleString("pt-BR")} de ${lastCoverage.expected.toLocaleString("pt-BR")}`);
+        }
+        lines.push("");
+        lines.push("--- cole o código abaixo em \"Importar critérios\" para refazer esta busca ---");
+        lines.push(encodeCriteriaCode(captureSearchCriteria()));
+        return lines.join("\n");
+    }
+
+    // ============================================================
     // CRITÉRIOS RECOLHÍVEIS
     // ============================================================
     // O resumo é a única coisa que sobra na tela quando os critérios estão
@@ -7115,6 +7296,13 @@
             .stats-row .control select { width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); }
             .stats-fixed { margin-bottom: 14px; }
             .stats-fixed .panel { background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; padding: 13px; }
+            .filters-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+            .criteria-io-panel { margin: 8px 0 12px; padding: 11px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
+            .criteria-io-panel[hidden] { display: none; }
+            .criteria-io-label { margin: 0 0 5px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--v-muted); }
+            .criteria-io-panel textarea { width: 100%; margin-bottom: 9px; padding: 8px 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 11.5px; font-family: inherit; resize: vertical; }
+            .criteria-io-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
             .stats-tag-title { font-size: 10.5px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 8px; }
             .stats-tag-row { display: flex; gap: 8px; flex-wrap: wrap; }
             .stats-tag { height: 30px; padding: 0 13px; border-radius: 99px; border: 1.5px solid var(--v-accent); color: var(--v-accent); background: var(--v-panel); font-size: 12px; font-weight: 700; cursor: pointer; }
@@ -7124,7 +7312,7 @@
             .stats-tag-slot.block-slot { display: block; width: 100%; padding: 12px 13px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
             .filter-checks { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; }
             .filter-checks-sep { width: 1px; height: 16px; background: var(--v-panel-alt-border); }
-            .stats-tag.filled { border-color: var(--v-accent); color: var(--v-accent); font-weight: 700; }
+            .stats-tag.filled:not(.active) { border-color: var(--v-accent); color: var(--v-accent); font-weight: 700; }
             .stats-tag.active .stats-tag-count { background: #fff; color: var(--v-accent); }
             .stats-tag-count { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; margin-left: 6px; padding: 0 4px; border-radius: 99px; background: var(--v-accent); color: #fff; font-size: 10px; font-weight: 800; }
 
@@ -7745,7 +7933,21 @@
                             <button type="button" class="prefs-import-btn pref-action">⬇ Importar</button>
                         </div>
                     </div>
-                    <p class="stats-tag-title">Filtros (clique para adicionar)</p>
+                    <div class="filters-head">
+                        <p class="stats-tag-title" style="margin:0">Filtros (clique para adicionar)</p>
+                        <button type="button" class="tiny criteria-copy" title="Copia um resumo legível dos critérios, com um código no fim para reimportar depois">Copiar critérios</button>
+                        <button type="button" class="tiny criteria-import-toggle" title="Cole o texto copiado antes (a anotação inteira serve) para preencher os campos de novo">Importar critérios</button>
+                    </div>
+                    <div class="criteria-io-panel" hidden>
+                        <p class="criteria-io-label">Critérios copiados — cole isto na sua anotação</p>
+                        <textarea class="criteria-out" rows="6" readonly></textarea>
+                        <p class="criteria-io-label">Importar: cole aqui o texto (ou só o código) e preencha os campos</p>
+                        <textarea class="criteria-in" rows="3" placeholder="Cole aqui a anotação inteira ou a linha TJSP-CRIT1:..."></textarea>
+                        <div class="criteria-io-actions">
+                            <button type="button" class="btn btn-primary criteria-apply">Preencher os campos com estes critérios</button>
+                            <button type="button" class="tiny criteria-io-close">Fechar</button>
+                        </div>
+                    </div>
                     <div class="stats-tag-row">
                         <button type="button" class="stats-tag" data-slot="statsStatusSlot">+ Status</button>
                         <button type="button" class="stats-tag" data-slot="statsUnidadeSlot">+ Unidade/Comarca</button>
@@ -8131,6 +8333,9 @@
             settingsSuggestedToggle: shadow.querySelector(".settings-suggested-toggle"), suggestedTeamsBox: shadow.getElementById("suggestedTeamsBox"), suggestedTeams: shadow.getElementById("suggestedTeams"),
             teamNewForm: shadow.getElementById("teamNewForm"), teamNewGseComboRoot: shadow.getElementById("teamNewGseCombo"), teamNewName: shadow.querySelector(".team-new-name"),
             teamNewCancel: shadow.querySelector(".team-new-cancel"), teamNewSave: shadow.querySelector(".team-new-save"),
+            criteriaCopy: shadow.querySelector(".criteria-copy"), criteriaImportToggle: shadow.querySelector(".criteria-import-toggle"),
+            criteriaIoPanel: shadow.querySelector(".criteria-io-panel"), criteriaOut: shadow.querySelector(".criteria-out"),
+            criteriaIn: shadow.querySelector(".criteria-in"), criteriaApply: shadow.querySelector(".criteria-apply"), criteriaIoClose: shadow.querySelector(".criteria-io-close"),
             criteriaBar: shadow.querySelector(".criteria-bar"), criteriaSummary: shadow.querySelector(".criteria-summary"),
             criteriaExpand: shadow.querySelector(".criteria-expand"), criteriaSearch: shadow.querySelector(".criteria-search"),
             collapseCriteria: shadow.querySelector(".collapse-criteria"),
@@ -8459,6 +8664,31 @@
         });
         ui.search.addEventListener("click", () => { if (renderQueryValidator()) performSearch(); });
         ui.collapseCriteria.addEventListener("click", () => setCriteriaCollapsed(true, true));
+        ui.criteriaCopy.addEventListener("click", () => {
+            const text = criteriaClipboardText();
+            ui.criteriaIoPanel.hidden = false;
+            ui.criteriaOut.value = text;
+            // Mostrar o texto na tela ANTES de tentar a área de transferência:
+            // se o navegador bloquear o acesso, o usuário ainda copia na mão.
+            navigator.clipboard.writeText(text)
+                .then(() => setStatus("Critérios copiados para a área de transferência.", "success"))
+                .catch(() => setStatus("Não consegui usar a área de transferência — o texto está aí embaixo, copie manualmente.", "warning"));
+        });
+        ui.criteriaImportToggle.addEventListener("click", () => {
+            ui.criteriaIoPanel.hidden = !ui.criteriaIoPanel.hidden;
+            if (!ui.criteriaIoPanel.hidden) ui.criteriaIn.focus();
+        });
+        ui.criteriaIoClose.addEventListener("click", () => { ui.criteriaIoPanel.hidden = true; });
+        ui.criteriaApply.addEventListener("click", () => {
+            try {
+                applySearchCriteria(decodeCriteriaCode(ui.criteriaIn.value));
+                ui.criteriaIn.value = "";
+                ui.criteriaIoPanel.hidden = true;
+                setStatus('Critérios preenchidos a partir do código. Confira e clique em "Pesquisar no acervo" — nada foi buscado ainda.', "success");
+            } catch (error) {
+                setStatus(`Não foi possível importar os critérios: ${error.message || error}`, "error");
+            }
+        });
         ui.criteriaExpand.addEventListener("click", () => setCriteriaCollapsed(false, true));
         ui.criteriaSearch.addEventListener("click", () => { if (renderQueryValidator()) performSearch(); else setCriteriaCollapsed(false, false); });
         try { setCriteriaCollapsed(localStorage.getItem(CRITERIA_COLLAPSED_STORAGE_KEY) === "1", false); } catch (_) {}
