@@ -307,6 +307,15 @@
     let resultsBucket = "text"; // "text" (busca por termo) ou "stats" — cada lado guarda o próprio resultado/paginação
     let textResultsStash = null;
     let statsResultsStash = null;
+    // ---- Snapshots (congelar/refinar) — recortes que sempre somam certo ----
+    // Cada snapshot guarda CÓPIAS dos registros (nunca os originais do acervo),
+    // com a linhagem (parentId) que permite mostrar o percentual sempre em
+    // relação à RAIZ — é isso que faz A / A+B / A+B+C somarem o esperado.
+    let snapshots = [];
+    let snapshotSeq = 0;
+    let refineBaseId = null;            // base do refinamento — escolha SEMPRE explícita, nunca "o que está na tela"
+    let currentResultIsRefinement = false; // true só depois que applyRefinement rodou: congelar daqui nasce FILHO
+    let viewingSnapshotId = null;       // snapshot atualmente carregado na tela (só pra rotular o status)
     const selectedIds = new Set();
     // Registro completo de cada item marcado, por ID — sobrevive à troca do
     // `archive` (pesquisa diferente) porque exportRows() precisa dos dados
@@ -2058,6 +2067,12 @@
             // disco, então sai do array. Daqui em diante ele volta só para os
             // cartões que aparecem na tela.
             archive.forEach(offloadText);
+            // Os recortes congelados guardam cópias que apontam para as MESMAS
+            // strings do acervo — sem soltá-las aqui, um recorte grande seguraria
+            // o corpus inteiro na memória e anularia o ganho da Fase 2. O texto
+            // está a salvo no disco e volta por id quando a tela ou um
+            // refinamento por termo precisar dele.
+            snapshots.forEach(snap => snap.records.forEach(offloadText));
             textInMemory = false;
 
             indexing = false;
@@ -4051,6 +4066,11 @@
 
     async function performSearch() {
         userEngagedWithResults = false;
+        // Pesquisar de novo é sair do recorte: o resultado volta a nascer da
+        // rede/acervo, então não pode herdar o vínculo de filho de ninguém.
+        currentResultIsRefinement = false;
+        viewingSnapshotId = null;
+        renderSnapshotPanel();
         try {
             // Termo é OPCIONAL nesta ferramenta de extração: sem termo, a busca
             // é um levantamento só por filtros estruturados (mesmo caminho da
@@ -4234,6 +4254,360 @@
                 <div class="gse-bar-track"><div class="gse-bar-fill" style="width:${Math.max(4, Math.round((count / maxCount) * 100))}%"></div></div>
                 <span class="gse-bar-count">${count.toLocaleString("pt-BR")}</span>
             </div>`).join("");
+    }
+
+    // ============================================================
+    // SNAPSHOTS — congelar e refinar (o mecanismo dos recortes que somam)
+    // ============================================================
+    // "Congelar resultado" fixa o resultado atual num recorte nomeado, com os
+    // registros copiados para dentro dele. A partir daí, REFINAR um recorte
+    // aplica filtros novos SÓ sobre os registros já congelados — zero chamada
+    // ao SMAX, então o recorte filho é sempre um subconjunto exato do pai e as
+    // contagens nunca brigam com o todo.
+    //
+    // Diferença de propósito em relação à cópia do script de relatórios: lá o
+    // snapshot hidratava o texto de TODOS os registros na hora de fixar. Aqui a
+    // cópia preserva o estado de texto como está (`__textOffloaded`): como
+    // string em JS é copiada por referência, congelar não duplica memória, e
+    // quando o texto já mora só no disco o refinamento por termo o lê de lá em
+    // blocos (ver refineTextMatches) — a extração pode ter dezenas de milhares
+    // de chamados e não pode trazer todo o corpus de volta pra RAM.
+    function findSnapshot(id) { return snapshots.find(s => s.id === id) || null; }
+
+    // Sobe por parentId até a raiz da linhagem. Defensivo contra ciclo (não
+    // deveria acontecer, mas evita loop infinito se dois apontarem entre si).
+    function snapshotRoot(snap) {
+        let current = snap;
+        const seen = new Set();
+        while (current && current.parentId != null && !seen.has(current.id)) {
+            seen.add(current.id);
+            const parent = findSnapshot(current.parentId);
+            if (!parent) break;
+            current = parent;
+        }
+        return current;
+    }
+
+    function snapshotDepth(snap) {
+        let depth = 0, current = snap;
+        const seen = new Set();
+        while (current && current.parentId != null && !seen.has(current.id)) {
+            seen.add(current.id);
+            const parent = findSnapshot(current.parentId);
+            if (!parent) break;
+            current = parent;
+            depth++;
+        }
+        return depth;
+    }
+
+    // Percentual SEMPRE em relação à RAIZ da linhagem (nunca ao pai imediato) —
+    // é isso que garante que recortes A / A+B / A+B+C tirados da mesma raiz
+    // somem o que se espera quando viram gráfico.
+    function snapshotPercentLabel(snap) {
+        const root = snapshotRoot(snap);
+        if (!root || root.id === snap.id) return "100%";
+        const denom = root.records.length || 1;
+        return `${((snap.records.length / denom) * 100).toFixed(1)}%`;
+    }
+
+    function summarizeFilterRows(rows) {
+        if (!rows || !rows.length) return "Sem filtros adicionais.";
+        return rows.map(r => `${r.label}: ${r.items.join(", ")}`).join(" · ");
+    }
+
+    // Monta a descrição do recorte NA HORA de congelá-lo — o estado atual dos
+    // controles fica gravado dentro dele para sempre (mexer nos filtros depois
+    // não altera nenhum recorte já congelado).
+    function currentFilterRowsForSnapshot(parentId) {
+        const rows = [];
+        if (parentId) {
+            const base = findSnapshot(parentId);
+            rows.push({ label: "Refinado de", items: [base ? base.label : parentId] });
+            const refineQuery = ui.refineQuery ? ui.refineQuery.value.trim() : "";
+            if (refineQuery) rows.push({ label: "Termo do refinamento", items: [refineQuery] });
+        } else {
+            const query = ui.query.value.trim();
+            rows.push({ label: "Termo", items: [query || "(sem termo — só filtros)"] });
+        }
+        rows.push(...buildFilterSummaryRows());
+        return rows;
+    }
+
+    // "Congelar resultado". `asChild` decide explicitamente se o novo recorte
+    // nasce filho da base de refinamento — nunca é inferido no escuro.
+    function freezeCurrentResult(asChild) {
+        if (!results.length) { setStatus("Não há resultado para congelar — pesquise ou refine um recorte primeiro.", "warning"); return; }
+        const parentId = asChild && findSnapshot(refineBaseId) ? refineBaseId : null;
+        snapshotSeq++;
+        const snap = {
+            id: `snap-${snapshotSeq}`,
+            label: `Recorte ${snapshotSeq}`,
+            parentId,
+            createdAt: new Date(),
+            records: results.map(r => Object.assign({}, r)),
+            filterRows: currentFilterRowsForSnapshot(parentId),
+            viewMode: searchMode, // pra reabrir o recorte na mesma apresentação em que foi congelado
+            // Guarda a cobertura vigente na carga que originou este recorte:
+            // meses depois ainda dá pra dizer se o número nasceu de uma carga
+            // conferida ou de uma com déficit conhecido.
+            coverage: lastCoverage ? Object.assign({}, lastCoverage) : null
+        };
+        snapshots.push(snap);
+        viewingSnapshotId = snap.id;
+        renderSnapshotPanel();
+        updateSnapshotButtons();
+        setStatus(`Recorte "${snap.label}" congelado com ${snap.records.length.toLocaleString("pt-BR")} solicitação(ões)${parentId ? ` (refinado de "${(findSnapshot(parentId) || {}).label || parentId}")` : ""}.`, "success");
+    }
+
+    // Carrega os registros de um recorte (CÓPIAS — os originais congelados
+    // nunca são entregues à tela) para navegação/contagem/exportação.
+    function loadSnapshotIntoView(snap) {
+        results = snap.records.map(r => Object.assign({}, r));
+        if (snap.viewMode) searchMode = snap.viewMode;
+        lastQueryTerms = [];
+        currentResultIsRefinement = false; // só vira true quando applyRefinement rodar de fato
+        currentPage = 1;
+        activeIndex = results.length ? 0 : -1;
+        focusedIndex = -1;
+        userEngagedWithResults = false;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        applySort();
+        renderStats(results);
+        renderResults();
+        updateSnapshotButtons();
+    }
+
+    function viewSnapshot(id) {
+        const snap = findSnapshot(id);
+        if (!snap) return;
+        viewingSnapshotId = id;
+        loadSnapshotIntoView(snap);
+        renderSnapshotPanel();
+        setStatus(`Vendo o recorte "${snap.label}" — ${snap.records.length.toLocaleString("pt-BR")} solicitação(ões). As contagens acima já são deste recorte.`, "info");
+    }
+
+    // Escolhe explicitamente a BASE do refinamento e mostra o conteúdo dela,
+    // pra ajustar os filtros com o contexto visual à frente.
+    function startRefine(id) {
+        const snap = findSnapshot(id);
+        if (!snap) return;
+        refineBaseId = id;
+        viewingSnapshotId = id;
+        renderBaseSnapshotOptions();
+        loadSnapshotIntoView(snap);
+        renderSnapshotPanel();
+        if (ui.refinePanel) {
+            ui.refinePanel.hidden = false;
+            ui.refinePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+        setStatus(`Base do refinamento: "${snap.label}" (${snap.records.length.toLocaleString("pt-BR")}). Ajuste os filtros avançados e/ou o termo do refinamento e clique em "Aplicar refinamento".`, "info");
+    }
+
+    // Aplica o termo do refinamento sobre os registros congelados. Quando o
+    // texto já mora só no disco, lê em blocos e DESCARTA logo depois: guarda só
+    // o veredito por id, então refinar não desfaz o ganho de memória.
+    async function refineTextMatches(records, prepared) {
+        const keep = new Set();
+        const pending = [];
+        records.forEach(item => {
+            if (needsHydration(item)) pending.push(item);
+            else if (matchesText(prepared, item)) keep.add(item.id);
+        });
+        for (let start = 0; start < pending.length; start += 400) {
+            const slice = pending.slice(start, start + 400);
+            const stored = await db.texts.bulkGet(slice.map(item => item.id));
+            stored.forEach((row, index) => {
+                const probe = {
+                    description: (row && row.description) || "",
+                    solution: (row && row.solution) || "",
+                    discussion: (row && row.discussion) || ""
+                };
+                if (matchesText(prepared, probe)) keep.add(slice[index].id);
+            });
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        return keep;
+    }
+
+    // Refinar = filtros estruturados (painel avançado) + termo opcional, SÓ
+    // sobre os registros congelados do recorte-base. Zero rede — por isso
+    // "Passou por GSE" fica de fora aqui: ele depende de consultar o histórico
+    // no SMAX. Use-o na busca, antes de congelar.
+    async function applyRefinement() {
+        const snap = findSnapshot(refineBaseId);
+        if (!snap) { setStatus('Escolha um recorte em "Basear-se em" antes de refinar.', "warning"); return; }
+        const rawQuery = ui.refineQuery.value;
+        const hasTerm = rawQuery.trim() !== "";
+        let prepared = null;
+        if (hasTerm) {
+            const check = validateQuerySyntax(rawQuery, ui.mode.value);
+            if (check.valid === false) { setStatus(`Termo do refinamento: ${check.message}`, "error"); return; }
+            const searchDescription = ui.fieldDescription.checked;
+            const searchSolution = ui.fieldSolution.checked;
+            const searchDiscussion = ui.fieldDiscussion.checked;
+            if (!searchDescription && !searchSolution && !searchDiscussion) { setStatus('Marque ao menos um campo em "Buscar em" para refinar por termo.', "warning"); return; }
+            // Discussão que nunca foi carregada devolveria "zero" como se fosse
+            // resposta — a falha silenciosa que esta ferramenta não pode ter.
+            if (searchDiscussion && !archiveIncludesDiscussion) {
+                setStatus('A carga atual não trouxe a Discussão — desmarque "Discussão" em "Buscar em" ou recarregue o acervo com ela marcada antes de refinar por esse campo.', "error");
+                return;
+            }
+            prepared = {
+                matcher: compileMatcher(rawQuery, ui.mode.value, ui.ignoreCase.checked, ui.ignoreAccents.checked),
+                searchDescription, searchSolution, searchDiscussion,
+                ignoreCase: ui.ignoreCase.checked, ignoreAccents: ui.ignoreAccents.checked
+            };
+        }
+        ui.refineApply.disabled = true;
+        try {
+            // A lista de GSEs marcadas também vale como recorte aqui: no
+            // refinamento ela não manda carregar nada, só restringe o que já
+            // está congelado às GSEs escolhidas (desmarcar = tirar do recorte).
+            const gseIds = new Set(selectedGseIds().map(String));
+            const structural = snap.records.filter(item => {
+                if (gseIds.size && !gseIds.has(String(item.groupId))) return false;
+                return advancedFiltersMatch(item);
+            });
+            let filtered = structural;
+            if (prepared) {
+                setStatus(`Refinando ${structural.length.toLocaleString("pt-BR")} solicitação(ões) pelo termo...`, "info");
+                const keep = await refineTextMatches(structural, prepared);
+                filtered = structural.filter(item => keep.has(item.id));
+            }
+            userEngagedWithResults = false;
+            results = filtered.map(r => Object.assign({}, r));
+            lastQueryTerms = hasTerm ? extractHighlightTerms(rawQuery, ui.mode.value) : [];
+            relevanceCache.clear();
+            currentPage = 1;
+            activeIndex = results.length ? 0 : -1;
+            focusedIndex = -1;
+            if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+            applySort();
+            renderStats(results);
+            renderResults();
+            currentResultIsRefinement = true; // congelar a partir daqui nasce FILHO de refineBaseId
+            viewingSnapshotId = null;
+            renderSnapshotPanel();
+            updateSnapshotButtons();
+            setStatus(`Refinamento aplicado: ${results.length.toLocaleString("pt-BR")} de ${snap.records.length.toLocaleString("pt-BR")} de "${snap.label}". Clique em "Congelar resultado" para guardar esta fatia como um novo recorte.`, results.length ? "success" : "warning");
+        } catch (error) {
+            setStatus(`Não foi possível refinar: ${error.message || error}`, "error");
+        } finally {
+            ui.refineApply.disabled = false;
+        }
+    }
+
+    function collectDescendantIds(id) {
+        const result = [];
+        const stack = [id];
+        while (stack.length) {
+            const current = stack.pop();
+            snapshots.filter(s => s.parentId === current).forEach(child => { result.push(child.id); stack.push(child.id); });
+        }
+        return result;
+    }
+
+    // Excluir é EM CASCATA (o recorte + tudo que derivou dele), com confirmação
+    // mostrando quantos somem — em vez de recusar a exclusão. Um recorte órfão
+    // apontando pra um pai inexistente quebraria o percentual da raiz.
+    function deleteSnapshot(id) {
+        const snap = findSnapshot(id);
+        if (!snap) return;
+        const descendants = collectDescendantIds(id);
+        const message = descendants.length
+            ? `Excluir "${snap.label}" também exclui ${descendants.length} recorte(s) derivado(s) dele. Continuar?`
+            : `Excluir o recorte "${snap.label}"?`;
+        if (!window.confirm(message)) return;
+        const idsToRemove = new Set([id, ...descendants]);
+        snapshots = snapshots.filter(s => !idsToRemove.has(s.id));
+        if (refineBaseId && idsToRemove.has(refineBaseId)) { refineBaseId = null; currentResultIsRefinement = false; }
+        if (viewingSnapshotId && idsToRemove.has(viewingSnapshotId)) viewingSnapshotId = null;
+        renderSnapshotPanel();
+        updateSnapshotButtons();
+        setStatus(`${idsToRemove.size} recorte(s) excluído(s).`, "success");
+    }
+
+    // Dropdown "Basear-se em": mais recente primeiro, escolha sempre visível —
+    // nunca uma inferência silenciosa de qual é a base.
+    function renderBaseSnapshotOptions() {
+        if (!ui.refineBaseSelect) return;
+        const options = snapshots.slice().sort((a, b) => b.createdAt - a.createdAt);
+        if (!options.length) {
+            ui.refineBaseSelect.innerHTML = '<option value="">Nenhum recorte congelado ainda</option>';
+            ui.refineBaseSelect.disabled = true;
+            ui.refineApply.disabled = true;
+            return;
+        }
+        ui.refineBaseSelect.disabled = false;
+        ui.refineApply.disabled = false;
+        ui.refineBaseSelect.innerHTML = options.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)} (${s.records.length.toLocaleString("pt-BR")})</option>`).join("");
+        if (!refineBaseId || !options.some(s => s.id === refineBaseId)) refineBaseId = options[0].id;
+        ui.refineBaseSelect.value = refineBaseId;
+    }
+
+    // Congelar depende de haver resultado; o rótulo diz de antemão se o novo
+    // recorte vai nascer filho (refinamento) ou raiz — sem surpresa depois.
+    function updateSnapshotButtons() {
+        if (!ui.freezeButton) return;
+        const asChild = currentResultIsRefinement && !!findSnapshot(refineBaseId);
+        ui.freezeButton.disabled = !results.length;
+        if (ui.freezeLabel) ui.freezeLabel.textContent = asChild ? "Congelar recorte filho" : "Congelar resultado";
+        ui.freezeButton.title = asChild
+            ? `O recorte nasce filho de "${(findSnapshot(refineBaseId) || {}).label || ""}" — o percentual dele será calculado sobre a raiz dessa linhagem.`
+            : "Fixa o resultado atual como um recorte imutável, que pode ser refinado depois sem consultar o SMAX de novo.";
+    }
+
+    function renderSnapshotPanel() {
+        if (!ui.snapshotPanel) return;
+        ui.snapshotPanel.hidden = !snapshots.length;
+        renderBaseSnapshotOptions();
+        if (!ui.snapshotTableBody) return;
+        ui.snapshotTableBody.innerHTML = "";
+        snapshots.slice().sort((a, b) => a.createdAt - b.createdAt).forEach(snap => {
+            const row = document.createElement("tr");
+            if (snap.id === viewingSnapshotId) row.className = "snapshot-current";
+            const summary = summarizeFilterRows(snap.filterRows);
+            const indent = snapshotDepth(snap);
+            const coverageMark = !snap.coverage ? ""
+                : snap.coverage.ok ? '<span class="snapshot-cov ok" title="A carga que originou este recorte teve a cobertura conferida contra o total do SMAX.">✔</span>'
+                : snap.coverage.estimated ? '<span class="snapshot-cov est" title="A carga que originou este recorte teve cobertura apenas estimada (janelas densas demais para confirmar o total).">≈</span>'
+                : '<span class="snapshot-cov warn" title="A carga que originou este recorte fechou com déficit em relação ao total do SMAX.">⚠</span>';
+            row.innerHTML = `
+                <td class="snapshot-label-cell" style="padding-left:${8 + indent * 16}px">${indent ? '<span class="snapshot-branch">↳</span>' : ""}<input type="text" class="snapshot-label-input" value="${escapeHtml(snap.label)}">${coverageMark}</td>
+                <td class="snapshot-count">${snap.records.length.toLocaleString("pt-BR")}</td>
+                <td class="snapshot-pct">${snapshotPercentLabel(snap)}</td>
+                <td class="snapshot-filter-desc" title="${escapeHtml(summary)}">${escapeHtml(summary)}</td>
+                <td class="snapshot-actions">
+                    <button type="button" class="tiny snapshot-view">Ver</button>
+                    <button type="button" class="tiny snapshot-refine">Refinar</button>
+                    <button type="button" class="tiny snapshot-export">Exportar</button>
+                    <button type="button" class="tiny btn-danger snapshot-delete">Excluir</button>
+                </td>`;
+            row.querySelector(".snapshot-label-input").addEventListener("change", event => {
+                const value = event.target.value.trim();
+                if (value) snap.label = value;
+                renderSnapshotPanel();
+            });
+            row.querySelector(".snapshot-view").addEventListener("click", () => viewSnapshot(snap.id));
+            row.querySelector(".snapshot-refine").addEventListener("click", () => startRefine(snap.id));
+            row.querySelector(".snapshot-export").addEventListener("click", () => exportSnapshot(snap.id));
+            row.querySelector(".snapshot-delete").addEventListener("click", () => deleteSnapshot(snap.id));
+            ui.snapshotTableBody.appendChild(row);
+        });
+    }
+
+    // Exportar um recorte = carregá-lo na tela e abrir o mesmo modal de
+    // exportação de sempre (formato, campos, seções). Assim existe UM caminho
+    // de exportação no script, e o que sai no arquivo é exatamente o que está à
+    // vista — sem uma segunda rota que possa divergir dela.
+    let openExportOptionsModalRef = null; // preenchido na fiação da UI (o modal vive naquele escopo)
+    function exportSnapshot(id) {
+        const snap = findSnapshot(id);
+        if (!snap) return;
+        if (selectedIds.size) clearSelection(); // seleção antiga venceria o recorte em exportRows()
+        viewSnapshot(id);
+        if (openExportOptionsModalRef) openExportOptionsModalRef("xlsx");
     }
 
     // ============================================================
@@ -5191,6 +5565,7 @@
         ui.nextResult.disabled = !valid || activeIndex === results.length - 1;
         ui.focusResult.disabled = !valid;
         ui.resultCounter.textContent = valid ? `${activeIndex + 1} de ${results.length}` : (results.length ? "" : "Nenhum resultado");
+        updateSnapshotButtons();
     }
 
     function activateResult(index, scroll) {
@@ -6670,6 +7045,44 @@
             .pagination button:disabled { opacity: .45; cursor: not-allowed; }
             .pagination span { font-size: 12px; color: var(--v-muted); }
 
+            /* Recortes congelados e refinamento — mesma linguagem visual das
+               outras faixas de estado (contagens/índice), sem inventar mais uma. */
+            .snapshot-panel { padding: 12px 20px; background: var(--v-panel-alt); border-bottom: 1px solid var(--v-panel-alt-border); flex-shrink: 0; max-height: 30vh; overflow-y: auto; }
+            .snapshot-panel[hidden] { display: none; }
+            .snapshot-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+            .snapshot-head h3 { margin: 0; font-size: 12.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--v-muted); }
+            .snapshot-head small { color: var(--v-muted-3); font-size: 10.5px; }
+            .snapshot-table-wrap { overflow-x: auto; }
+            .snapshot-table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 12px; }
+            .snapshot-table th { text-align: left; color: var(--v-muted); text-transform: uppercase; font-size: 9.5px; letter-spacing: .03em; padding: 5px 8px; border-bottom: 2px solid var(--v-panel-alt-border); white-space: nowrap; }
+            .snapshot-table td { padding: 5px 8px; border-bottom: 1px solid var(--v-panel-alt-border); color: var(--v-text-2); vertical-align: middle; }
+            .snapshot-table tr.snapshot-current td { background: var(--v-accent-soft); }
+            .snapshot-label-cell { display: flex; align-items: center; gap: 6px; }
+            .snapshot-branch { color: var(--v-muted-3); font-size: 12px; }
+            .snapshot-cov { font-size: 12px; cursor: help; }
+            .snapshot-cov.ok { color: #1f9254; }
+            .snapshot-cov.est { color: #9a6b00; }
+            .snapshot-cov.warn { color: var(--v-danger-text); }
+            .snapshot-count, .snapshot-pct { white-space: nowrap; font-variant-numeric: tabular-nums; }
+            .snapshot-filter-desc { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--v-muted-2); font-size: 11px; }
+            .snapshot-label-input { width: 100%; min-width: 130px; height: 28px; padding: 0 7px; border: 1px solid var(--v-input-border); border-radius: 5px; background: var(--v-panel); color: var(--v-text); font-size: 12px; font-weight: 700; }
+            .snapshot-actions { display: flex; gap: 4px; flex-wrap: nowrap; white-space: nowrap; }
+            .snapshot-actions .btn-danger { border: 1px solid var(--v-danger-border); background: transparent; color: var(--v-danger-text); }
+
+            .refine-panel { padding: 12px 20px; background: var(--v-accent-soft); border-bottom: 1px solid var(--v-accent-soft-border); flex-shrink: 0; }
+            .refine-panel[hidden] { display: none; }
+            .refine-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+            .refine-head h3 { flex: 1; margin: 0; font-size: 12.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--v-accent); }
+            .refine-close { border: none; background: transparent; color: var(--v-muted); font-size: 18px; line-height: 1; cursor: pointer; }
+            .refine-hint { margin: 0 0 10px; font-size: 11.5px; line-height: 1.5; color: var(--v-text-2); }
+            .refine-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+            .refine-base-wrap { min-width: 240px; }
+            .refine-query-wrap { flex: 1; min-width: 280px; }
+            .refine-base-select { width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; }
+            .refine-query { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; font-family: inherit; }
+            .refine-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+            .refine-actions small { color: var(--v-muted-3); font-size: 11px; }
+
             .focus-overlay { position: absolute; inset: 0; z-index: 25; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; }
             .focus-overlay[hidden] { display: none; }
 
@@ -7002,6 +7415,7 @@
                     </div>
                 </div>
                 <div class="spacer"></div>
+                <button class="btn btn-primary freeze-result" type="button" disabled title="Fixa o resultado atual como um recorte imutável, que pode ser refinado depois sem consultar o SMAX de novo."><svg viewBox="0 0 24 24"><path d="M12 3v18M4.5 7.5l15 9M19.5 7.5l-15 9"></path></svg><span class="freeze-label">Congelar resultado</span></button>
                 <button class="btn btn-secondary copy" type="button" disabled><svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 012-2h10"></path></svg>Copiar resumo</button>
                 <div class="export-wrap">
                     <button class="btn btn-secondary export-toggle" type="button" disabled><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 21h16"></path></svg>Exportar</button>
@@ -7011,6 +7425,39 @@
                         <button class="export-open" data-format="md" type="button">✍ Markdown (.md)</button>
                         <button class="export-open" data-format="txt" type="button">📝 Texto (.txt)</button>
                     </div>
+                </div>
+            </div>
+            <div class="snapshot-panel" hidden>
+                <div class="snapshot-head">
+                    <h3>Recortes congelados</h3>
+                    <small>% sempre em relação à RAIZ da linhagem de cada um — não ao pai imediato. Refinar nunca consulta o SMAX de novo.</small>
+                </div>
+                <div class="snapshot-table-wrap">
+                    <table class="snapshot-table">
+                        <thead><tr><th>Rótulo</th><th>Qtde.</th><th>% da raiz</th><th>Como foi produzido</th><th>Ações</th></tr></thead>
+                        <tbody class="snapshot-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="refine-panel" hidden>
+                <div class="refine-head">
+                    <h3>Refinar a partir de um recorte</h3>
+                    <button type="button" class="refine-close" title="Fechar (não descarta nenhum recorte já congelado)">×</button>
+                </div>
+                <p class="refine-hint">A base é SEMPRE uma escolha explícita — nunca "o que está na tela agora". Ajuste os filtros avançados (inclusive as GSEs marcadas) e/ou escreva um termo aqui, depois clique em "Aplicar refinamento". Nada disto consulta o SMAX: tudo roda sobre os registros já congelados no recorte escolhido, então o filho é sempre um subconjunto exato do pai.</p>
+                <div class="refine-row">
+                    <div class="control refine-base-wrap">
+                        <label>Basear-se em</label>
+                        <select class="refine-base-select"></select>
+                    </div>
+                    <div class="control refine-query-wrap">
+                        <label>Termo do refinamento (opcional — mesma sintaxe da busca: E / OU / NÃO / PERTO / "frase")</label>
+                        <input class="refine-query" type="text" placeholder='Ex.: certificado E (erro OU falha)'>
+                    </div>
+                </div>
+                <div class="refine-actions">
+                    <button type="button" class="btn btn-primary refine-apply" disabled>Aplicar refinamento</button>
+                    <small>Os campos do termo são os marcados em "Buscar em". "Passou por GSE" não vale aqui — ele depende de consultar o SMAX, e refinar não faz nenhuma chamada de rede; use-o na busca, antes de congelar.</small>
                 </div>
             </div>
             <nav class="navigator">
@@ -7190,6 +7637,10 @@
             solutionDateFromWrap: shadow.querySelector(".solution-date-from-wrap"), solutionDateToWrap: shadow.querySelector(".solution-date-to-wrap"), solutionDateDaysWrap: shadow.querySelector(".solution-date-days-wrap"), solutionDateFromLabel: shadow.querySelector(".solution-date-from-label"), solutionDateToLabel: shadow.querySelector(".solution-date-to-label"),
             gseList: shadow.querySelector(".gse-list"), gseTeams: shadow.getElementById("gseTeams"), gseTeamsTitle: shadow.getElementById("gseTeamsTitle"), ignoreGse: shadow.querySelector(".ignore-gse"), ignoreGseWrap: shadow.querySelector(".ignore-gse-wrap"), extraGseComboRoot: shadow.getElementById("extraGseCombo"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
             historyGseComboRoot: shadow.getElementById("historyGseCombo"), historyGseProgress: shadow.querySelector(".history-gse-progress"), historyGseProgressText: shadow.querySelector(".history-gse-progress-text"), historyTeams: shadow.getElementById("historyTeams"), historyTeamsTitle: shadow.getElementById("historyTeamsTitle"), historyTeamsHint: shadow.getElementById("historyTeamsHint"), historyGseExclude: shadow.querySelector(".history-gse-exclude"), historyGseHint: shadow.querySelector(".history-gse-hint"),
+            freezeButton: shadow.querySelector(".freeze-result"), freezeLabel: shadow.querySelector(".freeze-label"),
+            snapshotPanel: shadow.querySelector(".snapshot-panel"), snapshotTableBody: shadow.querySelector(".snapshot-tbody"),
+            refinePanel: shadow.querySelector(".refine-panel"), refineBaseSelect: shadow.querySelector(".refine-base-select"),
+            refineQuery: shadow.querySelector(".refine-query"), refineApply: shadow.querySelector(".refine-apply"), refineClose: shadow.querySelector(".refine-close"),
             copyButton: shadow.querySelector(".copy"), exportToggle: shadow.querySelector(".export-toggle"), exportWrap: shadow.querySelector(".export-wrap"), exportMenu: shadow.querySelector(".export-menu"),
             exportOptsOverlay: shadow.querySelector(".export-opts-overlay"), exportOptsName: shadow.querySelector(".export-opts-name"),
             exportOptsFilters: shadow.querySelector(".export-opts-filters"), exportOptsIndice: shadow.querySelector(".export-opts-indice"), exportOptsDistribuicao: shadow.querySelector(".export-opts-distribuicao"),
@@ -7619,6 +8070,16 @@
             button.addEventListener("click", () => { openExportOptionsModal(button.dataset.format); closeExportMenu(); });
         });
         ui.copyButton.addEventListener("click", copySummary);
+
+        // Congelar/refinar. O modal de exportação vive neste escopo, então a
+        // tabela de recortes chega até ele por esta referência — em vez de uma
+        // segunda rota de exportação que poderia divergir da da tela.
+        openExportOptionsModalRef = openExportOptionsModal;
+        ui.freezeButton.addEventListener("click", () => freezeCurrentResult(currentResultIsRefinement));
+        ui.refineBaseSelect.addEventListener("change", () => { refineBaseId = ui.refineBaseSelect.value; });
+        ui.refineApply.addEventListener("click", applyRefinement);
+        ui.refineClose.addEventListener("click", () => { ui.refinePanel.hidden = true; });
+        ui.refineQuery.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); applyRefinement(); } });
 
         // Modal único de exportação: escolhe formato, campos e (só no HTML)
         // layout e seções. A seleção de campos vale para TODOS os formatos e
