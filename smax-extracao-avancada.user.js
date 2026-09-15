@@ -120,6 +120,7 @@
     const MODAL_SCALE_STORAGE_KEY = "tjspArchivoModalScale"; // 80-140, por navegador/pessoa — % do tamanho padrão do modal
     const FONT_ZOOM_STORAGE_KEY = "tjspArchivoFontZoom"; // 80-140, por navegador/pessoa — % do zoom do modal inteiro (texto + espaçamento)
     const STATS_VIEW_STORAGE_KEY = "tjspArchivoStatsView"; // "table" ou "grid"
+    const CRITERIA_COLLAPSED_STORAGE_KEY = "tjspArchivoCriteriosRecolhidos"; // "1"/"0" — estado inicial dos critérios ao abrir
     const CARD_STYLE_STORAGE_KEY = "tjspArchivoCardStyle"; // "3b" (preenchido) ou "3d" (só barra) — Termos/Semelhança
     const LAUNCHER_POS_STORAGE_KEY = "tjspArchivoLauncherPos"; // {left,top} em px — posição arrastada do ícone flutuante
     const PREFS_STORAGE_KEY = "tjspArchivoPreferencias"; // combinações de filtro da Busca Estatística, só neste navegador
@@ -303,6 +304,10 @@
     // DADOS: o texto continua a um hover/Expandir de distância, mas quem manda
     // na tela é a grade de colunas.
     let viewMode = "table"; // "table" (padrão), "grid" ou "cards"
+    // Critérios recolhidos: a tela é de extração, então o normal é olhar a
+    // LISTA. Tudo que é critério (busca, GSEs, tags, barra de ações, recortes
+    // e refinamento) vira uma faixa fina com o resumo do que está valendo.
+    let criteriaCollapsed = false;
     let cardStyleMode = "3b"; // "3b" (padrão, preenchido) ou "3d" (só barra no topo) — Termos/Semelhança
     let statsPreferences = []; // preferências de filtro salvas (Busca Estatística), carregadas do localStorage no init
     let userDefaultGses = []; // [{id,name}] — GSEs padrão configuradas pelo usuário, carregadas do localStorage no init
@@ -4219,6 +4224,14 @@
         renderResults();
     }
 
+    // Recolher é automático DEPOIS de pesquisar, nunca antes: enquanto a busca
+    // não devolveu nada, os critérios são justamente o que o usuário precisa
+    // ver para corrigir o que pediu.
+    function collapseCriteriaAfterSearch() {
+        if (!results.length || criteriaCollapsed) { renderCriteriaSummary(); return; }
+        setCriteriaCollapsed(true, false);
+    }
+
     async function performSearch() {
         userEngagedWithResults = false;
         // Pesquisar de novo é sair do recorte: o resultado volta a nascer da
@@ -4243,6 +4256,7 @@
                 applyStatsFilter(false);
                 await maybeApplyTextTriage();
                 await maybeApplyHistoryGseFilter();
+                collapseCriteriaAfterSearch();
                 return;
             }
             searchMode = "terms";
@@ -4254,6 +4268,7 @@
             else applyTermSearch(prepared, false);
             await maybeApplyTextTriage();
             await maybeApplyHistoryGseFilter();
+            collapseCriteriaAfterSearch();
         } catch (error) {
             setStatus(error.message || String(error), "error");
         }
@@ -4543,6 +4558,7 @@
         renderBaseSnapshotOptions();
         loadSnapshotIntoView(snap);
         renderSnapshotPanel();
+        setCriteriaCollapsed(false, false);
         if (ui.refinePanel) {
             ui.refinePanel.hidden = false;
             ui.refinePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -4762,6 +4778,109 @@
         if (selectedIds.size) clearSelection(); // seleção antiga venceria o recorte em exportRows()
         viewSnapshot(id);
         if (openExportOptionsModalRef) openExportOptionsModalRef("xlsx");
+    }
+
+    // ============================================================
+    // DISCUSSÃO SOB DEMANDA
+    // ============================================================
+    // Carregar a Discussão de todo o acervo é caro (é o campo que mais pesa na
+    // carga e no índice), então o normal é levantar sem ela. Quando bate a
+    // dúvida em UM chamado específico, este caminho busca a discussão só dele,
+    // na hora — o mesmo recurso que a exportação já usava para completar o
+    // relatório, agora disponível na tela.
+    const discussionFetches = new Map(); // id -> Promise, para dois cliques não virarem duas consultas
+
+    async function fetchDiscussionFor(id) {
+        const layout = `${ARCHIVE_LAYOUT_BASE},Comments`;
+        const params = new URLSearchParams({ filter: `Id = '${id}'`, layout, size: "1", skip: "0" });
+        const payload = await fetchJson(`${getRestBase()}/ems/Request?${params}`);
+        const entity = Array.isArray(payload.entities) ? payload.entities[0] : null;
+        if (!entity) throw new Error("o SMAX não devolveu esta solicitação");
+        return normalizeRecord(entity);
+    }
+
+    // Guarda o que veio no item da tela, no registro do acervo (se ele ainda
+    // estiver carregado) e no texto salvo em disco — assim a discussão buscada
+    // uma vez continua valendo nas próximas navegações e sessões. NÃO cria
+    // linha nova no disco: se o chamado ainda não foi indexado, a Fase 2 vai
+    // gravá-lo com a discussão já em memória, e inventar uma linha parcial
+    // aqui bagunçaria a contabilidade do índice.
+    async function rememberDiscussion(item, discussion, entries) {
+        item.discussion = discussion;
+        item.discussionEntries = entries;
+        item.__discussionEmpty = !entries.length;
+        const archived = archive.find(candidate => candidate.id === item.id);
+        if (archived && archived !== item) {
+            archived.discussion = discussion;
+            archived.discussionEntries = entries;
+            archived.__discussionEmpty = !entries.length;
+        }
+        // Recortes congelados que contêm este chamado também recebem a
+        // discussão — senão reabrir o recorte pediria a mesma busca de novo.
+        snapshots.forEach(snap => snap.records.forEach(record => {
+            if (record.id !== item.id) return;
+            record.discussion = discussion;
+            record.discussionEntries = entries;
+            record.__discussionEmpty = !entries.length;
+        }));
+        const cached = hydrationCache.get(item.id);
+        if (cached) rememberHydrated(item.id, Object.assign({}, cached, { discussion, discussionEntries: entries }));
+        try {
+            const row = await db.texts.get(item.id);
+            if (row) await db.texts.put(Object.assign({}, row, { discussion, discussionEntries: entries }));
+        } catch (_) { /* disco indisponível não pode impedir de ver na tela */ }
+    }
+
+    async function loadDiscussionOnDemand(item) {
+        if (discussionFetches.has(item.id)) return discussionFetches.get(item.id);
+        const promise = (async () => {
+            const normalized = await fetchDiscussionFor(item.id);
+            await rememberDiscussion(item, normalized.discussion || "", normalized.discussionEntries || []);
+        })();
+        discussionFetches.set(item.id, promise);
+        try { await promise; } finally { discussionFetches.delete(item.id); }
+    }
+
+    // ============================================================
+    // CRITÉRIOS RECOLHÍVEIS
+    // ============================================================
+    // O resumo é a única coisa que sobra na tela quando os critérios estão
+    // recolhidos, então ele precisa dizer TUDO que está filtrando — um filtro
+    // esquecido fora do resumo seria um corte invisível, o oposto do que esta
+    // ferramenta promete.
+    function criteriaSummaryText() {
+        if (!ui || !ui.query) return "";
+        const parts = [];
+        const term = ui.query.value.trim();
+        parts.push(term ? `termo: ${term}` : "sem termo");
+        const gseIds = selectedGseIds();
+        parts.push(ignoringGse() ? "todas as GSEs (sem âncora)" : (gseIds.length === 1 ? "1 GSE" : `${gseIds.length} GSEs`));
+        const period = describeDateFilterValue(ui.dateMode.value, ui.dateDays.value, ui.dateFrom.value, ui.dateTo.value);
+        if (period) parts.push(period);
+        const skip = new Set(["Campos buscados", "GSEs", "Período (abertura)"]);
+        const extra = buildFilterSummaryRows().filter(row => !skip.has(row.label));
+        extra.forEach(row => parts.push(`${row.label}: ${row.items.join(", ")}`));
+        return parts.join(" · ");
+    }
+
+    function renderCriteriaSummary() {
+        if (!ui || !ui.criteriaSummary) return;
+        const text = criteriaSummaryText();
+        ui.criteriaSummary.textContent = text;
+        ui.criteriaSummary.title = text;
+    }
+
+    function setCriteriaCollapsed(collapsed, remember) {
+        criteriaCollapsed = !!collapsed;
+        const dialog = host && host.shadowRoot ? host.shadowRoot.querySelector(".dialog") : null;
+        if (dialog) dialog.classList.toggle("criteria-collapsed", criteriaCollapsed);
+        if (ui && ui.collapseCriteria) {
+            ui.collapseCriteria.setAttribute("aria-expanded", String(!criteriaCollapsed));
+        }
+        if (criteriaCollapsed) renderCriteriaSummary();
+        if (remember) {
+            try { localStorage.setItem(CRITERIA_COLLAPSED_STORAGE_KEY, criteriaCollapsed ? "1" : "0"); } catch (_) {}
+        }
     }
 
     // ============================================================
@@ -5552,6 +5671,18 @@
     //      lugar — que é exatamente o botão Copiar.
     // Consequência aceita: imagens aparecem como "[Imagem anexada]" aqui, mas
     // vêm corretamente na cópia.
+    // Mostrado no lugar da Discussão quando a carga não a trouxe: o botão
+    // busca só a deste chamado. Depois de buscar, se não houver comentário
+    // nenhum, o bloco diz isso — em vez de sumir e deixar a dúvida de se a
+    // busca falhou ou se o chamado realmente não tem discussão.
+    function discussionAskBlock(item) {
+        const body = item.__discussionEmpty
+            ? '<p class="disc-empty">Sem discussão registrada nesta solicitação.</p>'
+            : '<button type="button" class="btn btn-secondary load-discussion"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"></path></svg>Ver discussão</button>'
+              + '<small class="disc-ask-hint">A carga atual não trouxe a Discussão. Buscar consulta o SMAX agora, só para esta solicitação.</small>';
+        return `<div class="field f-disc disc-ask"><span class="badge">C</span><div class="field-body"><span class="field-label">Discussão</span>${body}</div></div>`;
+    }
+
     function richContentBlock(kind, label, badge, text, withCopy) {
         const copyButton = withCopy
             ? `<button class="copy-rich" type="button" data-copy-kind="${kind}" title="Copiar ${label.toLowerCase()} com a formatação original do SMAX"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 012-2h10"></path></svg>Copiar</button>`
@@ -5791,7 +5922,7 @@
             <div class="focus-scroll">
                 ${richContentBlock("desc", "Descrição", "D", item.description, false)}
                 ${richContentBlock("sol", "Solução", "S", item.solution, true)}
-                ${lastSearchIncludedDiscussion && item.discussion ? discussionBlock(item.discussionEntries) : ""}
+                ${item.discussionEntries && item.discussionEntries.length ? discussionBlock(item.discussionEntries) : discussionAskBlock(item)}
                 <footer>
                     <div><small>Solicitado para</small><span>${escapeHtml(item.requestedFor)}</span></div>
                     <div><small>Designado Especialista</small><span>${escapeHtml(item.assignedSpecialist)}</span></div>
@@ -5802,6 +5933,21 @@
         ui.focusBody.querySelector(".focus-prev").addEventListener("click", () => { if (activeIndex > 0) { activateResult(activeIndex - 1, false); openFocus(activeIndex); } });
         ui.focusBody.querySelector(".focus-next").addEventListener("click", () => { if (activeIndex < results.length - 1) { activateResult(activeIndex + 1, false); openFocus(activeIndex); } });
         ui.focusBody.querySelector(".focus-checkbox").addEventListener("change", event => setSelection(item, event.target.checked));
+        const askDiscussion = ui.focusBody.querySelector(".load-discussion");
+        if (askDiscussion) {
+            askDiscussion.addEventListener("click", async () => {
+                askDiscussion.disabled = true;
+                askDiscussion.textContent = "Buscando no SMAX...";
+                try {
+                    await loadDiscussionOnDemand(item);
+                    if (focusedIndex === index) openFocus(index);
+                } catch (error) {
+                    askDiscussion.disabled = false;
+                    askDiscussion.textContent = "Ver discussão";
+                    setStatus(`Não foi possível buscar a discussão de ${item.id}: ${error.message || error}`, "error");
+                }
+            });
+        }
         wireRichCopyButtons(ui.focusBody, item);
         ui.focusOverlay.hidden = false;
         const scroller = ui.focusBody.querySelector(".focus-scroll");
@@ -5916,7 +6062,7 @@
                 </header>
                 ${contentBlock("desc", "Descrição", "D", item.description)}
                 ${contentBlock("sol", "Solução", "S", item.solution, true)}
-                ${lastSearchIncludedDiscussion && item.discussion ? discussionBlock(item.discussionEntries) : ""}
+                ${item.discussionEntries && item.discussionEntries.length ? discussionBlock(item.discussionEntries) : ""}
                 <footer><span><small>Solicitado para</small>${escapeHtml(item.requestedFor)}</span><span><small>Designado Especialista</small>${escapeHtml(item.assignedSpecialist)}</span><span><small>Data de Solução</small>${escapeHtml(formatDate(item.solutionDate))}</span></footer>`;
 
             card.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
@@ -6889,6 +7035,28 @@
             .history-mode-row label { display: inline-flex !important; align-items: center; gap: 6px; margin: 0 !important; font-size: 11.5px; font-weight: 400 !important; color: var(--v-text-2) !important; text-transform: none !important; letter-spacing: normal !important; cursor: pointer; }
             .history-mode-row input[type="radio"] { width: 14px; height: 14px; padding: 0; margin: 0; accent-color: var(--v-accent); flex-shrink: 0; }
 
+            /* Recolhido, tudo que é critério sai da tela e sobra esta faixa.
+               O display: none vem daqui (e não de um atributo hidden em cada bloco)
+               porque cada um deles já tem a própria regra de visibilidade —
+               mexer nelas faria o painel de recortes voltar sozinho. */
+            .disc-ask .field-body { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+            .disc-ask .field-label { width: 100%; }
+            .disc-ask .load-discussion { height: 30px; }
+            .disc-ask .load-discussion svg { width: 14px; height: 14px; }
+            .disc-ask-hint, .disc-empty { font-size: 11.5px; color: var(--v-muted-3); margin: 0; }
+
+            .criteria-bar { display: none; align-items: center; gap: 12px; padding: 8px 20px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); flex-shrink: 0; }
+            .criteria-collapsed .criteria-bar { display: flex; }
+            .criteria-collapsed .search-area,
+            .criteria-collapsed .actions-row,
+            .criteria-collapsed .snapshot-panel,
+            .criteria-collapsed .refine-panel { display: none !important; }
+            .criteria-expand { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 11px; border: 1px solid var(--v-accent); border-radius: 99px; background: transparent; color: var(--v-accent); font-size: 11.5px; font-weight: 700; cursor: pointer; flex-shrink: 0; }
+            .criteria-expand svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
+            .criteria-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--v-text-2); }
+            .criteria-search { flex-shrink: 0; height: 30px; }
+            .collapse-criteria svg { width: 13px; height: 13px; }
+
             .gse-surface { margin-top: 12px; }
             .gse-surface .panel { padding: 11px 13px; }
             .gse-surface .gse-list { max-height: 96px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
@@ -7418,6 +7586,11 @@
                 <button class="index-reset" type="button" title="Apaga o acervo salvo em disco e força a próxima carga a baixar e indexar tudo de novo. Use quando chamados já indexados mudaram de status — a sincronização incremental só traz chamados novos.">Reindexar do zero</button>
             </div>
             <div class="index-report" hidden></div>
+            <div class="criteria-bar">
+                <button class="criteria-expand" type="button" title="Abrir os critérios de pesquisa"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg>Critérios</button>
+                <span class="criteria-summary"></span>
+                <button class="btn btn-primary criteria-search" type="button" title="Pesquisar de novo com estes mesmos critérios"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>Pesquisar</button>
+            </div>
             <section class="search-area">
                 <div class="terms-mode">
                     <div class="query-row">
@@ -7660,6 +7833,7 @@
                 <div class="spacer"></div>
                 <button class="btn btn-primary freeze-result" type="button" disabled title="Fixa o resultado atual como um recorte imutável, que pode ser refinado depois sem consultar o SMAX de novo."><svg viewBox="0 0 24 24"><path d="M12 3v18M4.5 7.5l15 9M19.5 7.5l-15 9"></path></svg><span class="freeze-label">Congelar resultado</span></button>
                 <button class="btn btn-secondary copy" type="button" disabled><svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 012-2h10"></path></svg>Copiar resumo</button>
+                <button class="btn btn-secondary collapse-criteria" type="button" aria-expanded="true" title="Recolhe todos os critérios e dá a tela para a lista de resultados"><svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"></path></svg>Recolher critérios</button>
                 <div class="export-wrap">
                     <button class="btn btn-secondary export-toggle" type="button" disabled><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 21h16"></path></svg>Exportar</button>
                     <div class="export-menu" hidden>
@@ -7859,6 +8033,9 @@
             settingsSuggestedToggle: shadow.querySelector(".settings-suggested-toggle"), suggestedTeamsBox: shadow.getElementById("suggestedTeamsBox"), suggestedTeams: shadow.getElementById("suggestedTeams"),
             teamNewForm: shadow.getElementById("teamNewForm"), teamNewGseComboRoot: shadow.getElementById("teamNewGseCombo"), teamNewName: shadow.querySelector(".team-new-name"),
             teamNewCancel: shadow.querySelector(".team-new-cancel"), teamNewSave: shadow.querySelector(".team-new-save"),
+            criteriaBar: shadow.querySelector(".criteria-bar"), criteriaSummary: shadow.querySelector(".criteria-summary"),
+            criteriaExpand: shadow.querySelector(".criteria-expand"), criteriaSearch: shadow.querySelector(".criteria-search"),
+            collapseCriteria: shadow.querySelector(".collapse-criteria"),
             statsStrip: shadow.querySelector(".stats-strip"), statsCount: shadow.querySelector(".count"), statsLoadedAt: shadow.querySelector(".loaded-at"), statsRange: shadow.querySelector(".range"), statsGseList: shadow.querySelector(".stats-gse"), coverageBadge: shadow.querySelector(".coverage-badge"),
             indexStrip: shadow.querySelector(".index-strip"), indexDot: shadow.querySelector(".index-dot"), indexLabel: shadow.querySelector(".index-label"),
             indexTrack: shadow.querySelector(".index-track"), indexFill: shadow.querySelector(".index-fill"), indexReset: shadow.querySelector(".index-reset"),
@@ -8183,6 +8360,10 @@
             } finally { ui.indexReset.disabled = false; }
         });
         ui.search.addEventListener("click", () => { if (renderQueryValidator()) performSearch(); });
+        ui.collapseCriteria.addEventListener("click", () => setCriteriaCollapsed(true, true));
+        ui.criteriaExpand.addEventListener("click", () => setCriteriaCollapsed(false, true));
+        ui.criteriaSearch.addEventListener("click", () => { if (renderQueryValidator()) performSearch(); else setCriteriaCollapsed(false, false); });
+        try { setCriteriaCollapsed(localStorage.getItem(CRITERIA_COLLAPSED_STORAGE_KEY) === "1", false); } catch (_) {}
         ui.query.addEventListener("input", showQueryTyping);
         ui.query.addEventListener("blur", renderQueryValidator);
         ui.query.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); if (renderQueryValidator()) performSearch(); } });
