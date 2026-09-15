@@ -296,7 +296,12 @@
     let loadedSignature = null;
     let liveSearchDuringLoad = null;
     let loadingProgressInfo = null; // { windowIndex, windowCount, label } enquanto carrega por período, null quando não está carregando
-    let statsViewMode = "table"; // "table" (padrão) ou "grid" — só usado na Busca Estatística
+    // Apresentação do resultado, agora única pra toda a ferramenta (antes a
+    // tabela era privilégio da Busca Estatística e a busca por termo só sabia
+    // desenhar cartões). "table" é o padrão porque esta é uma ferramenta de
+    // DADOS: o texto continua a um hover/Expandir de distância, mas quem manda
+    // na tela é a grade de colunas.
+    let viewMode = "table"; // "table" (padrão), "grid" ou "cards"
     let cardStyleMode = "3b"; // "3b" (padrão, preenchido) ou "3d" (só barra no topo) — Termos/Semelhança
     let statsPreferences = []; // preferências de filtro salvas (Busca Estatística), carregadas do localStorage no init
     let userDefaultGses = []; // [{id,name}] — GSEs padrão configuradas pelo usuário, carregadas do localStorage no init
@@ -304,9 +309,6 @@
     let customTeams = []; // equipes criadas pelo usuário, carregadas do localStorage no init — somadas às NATIVE_TEAMS
     let gseListComboInstance = null; // adapta a lista de checkboxes principal pro mesmo helper renderTeamTogglers usa nos combos de verdade
     let teamNewGseCombo = null; // combobox do formulário "+ Nova equipe", instalado uma vez sob demanda
-    let resultsBucket = "text"; // "text" (busca por termo) ou "stats" — cada lado guarda o próprio resultado/paginação
-    let textResultsStash = null;
-    let statsResultsStash = null;
     // ---- Snapshots (congelar/refinar) — recortes que sempre somam certo ----
     // Cada snapshot guarda CÓPIAS dos registros (nunca os originais do acervo),
     // com a linhagem (parentId) que permite mostrar o percentual sempre em
@@ -4238,19 +4240,6 @@
         renderResults();
     }
 
-    async function performStatsSearch() {
-        userEngagedWithResults = false;
-        try {
-            searchMode = "stats";
-            await ensureArchiveLoaded(() => applyStatsFilter(true));
-            if (!archive.length) return;
-            applyStatsFilter(false);
-            await maybeApplyHistoryGseFilter();
-        } catch (error) {
-            setStatus(error.message || String(error), "error");
-        }
-    }
-
     // Contagem de ocorrências por chamado, quando o texto já vive só no disco.
     // Preenchido sob demanda pela ordenação por relevância.
     const relevanceCache = new Map(); // id -> nº de ocorrências dos termos da busca
@@ -4465,7 +4454,7 @@
             createdAt: new Date(),
             records: results.map(r => Object.assign({}, r)),
             filterRows: currentFilterRowsForSnapshot(parentId),
-            viewMode: searchMode, // pra reabrir o recorte na mesma apresentação em que foi congelado
+            searchMode, // com ou sem termo — só descreve a ORIGEM do recorte (a apresentação é escolhida à parte, em viewMode)
             // Guarda a cobertura vigente na carga que originou este recorte:
             // meses depois ainda dá pra dizer se o número nasceu de uma carga
             // conferida ou de uma com déficit conhecido.
@@ -4482,7 +4471,7 @@
     // nunca são entregues à tela) para navegação/contagem/exportação.
     function loadSnapshotIntoView(snap) {
         results = snap.records.map(r => Object.assign({}, r));
-        if (snap.viewMode) searchMode = snap.viewMode;
+        if (snap.searchMode) searchMode = snap.searchMode;
         lastQueryTerms = [];
         currentResultIsRefinement = false; // só vira true quando applyRefinement rodar de fato
         currentPage = 1;
@@ -5813,86 +5802,6 @@
         updateNavigator();
     }
 
-    // Termos e Semelhança continuam compartilhando o mesmo resultado (você
-    // busca por termo e depois usa o mesmo acervo pra buscar semelhança, sem
-    // perder nada) — só a Busca Estatística guarda o próprio resultado à
-    // parte, porque misturar os dois não faz sentido nenhum na tela.
-    // Estado dos filtros guardado por aba. Sem isto, um "Status = Fechado"
-    // deixado na Busca Estatística continuava valendo ao voltar para a Pesquisa
-    // por termos e reduzia o resultado em silêncio — o mesmo tipo de vazamento
-    // que já tínhamos corrigido para os resultados, agora na direção contrária.
-    // A GSE fica de fora de propósito: ela define QUAL acervo está carregado,
-    // não filtra o resultado, e as configurações dizem que vale para as 3 abas.
-    let textFilterStash = null;
-    let statsFilterStash = null;
-
-    const EMPTY_FILTERS = {
-        specialistIds: [], requestedForIds: [],
-        statusValues: [], statusOperacionalValues: [], unidadeValues: [],
-        unidadeExcludeValues: [], requestedForExcludeIds: [], specialistExcludeIds: [],
-        triageInclude: "", triageExclude: "",
-        vipOnly: false, globalOnly: false, ignoreGse: false,
-        dateMode: "days", dateFrom: "", dateTo: "", dateDays: "180"
-    };
-
-    function swapFilterState(fromBucket, toBucket) {
-        const outgoing = captureStatsFilters();
-        outgoing.ignoreGse = !!(ui.ignoreGse && ui.ignoreGse.checked);
-        if (fromBucket === "text") textFilterStash = outgoing; else statsFilterStash = outgoing;
-
-        const incoming = toBucket === "text" ? textFilterStash : statsFilterStash;
-        // Aba nunca visitada começa limpa, em vez de herdar o que estava na
-        // outra — que é justamente o problema a evitar.
-        const target = Object.assign({}, incoming || EMPTY_FILTERS, { gseIds: selectedGseIds() });
-        applyStatsFilters(target);
-        if (ui.ignoreGse) ui.ignoreGse.checked = toBucket === "stats" && !!target.ignoreGse;
-    }
-
-    function enterResultsBucket(bucket) {
-        if (bucket === resultsBucket) return;
-        swapFilterState(resultsBucket, bucket);
-        const outgoing = { results, currentPage, activeIndex, focusedIndex, sortMode, lastQueryTerms, lastSearchIncludedDiscussion, searchMode };
-        if (resultsBucket === "text") textResultsStash = outgoing; else statsResultsStash = outgoing;
-        resultsBucket = bucket;
-        const incoming = bucket === "text" ? textResultsStash : statsResultsStash;
-        if (incoming) {
-            results = incoming.results; currentPage = incoming.currentPage; activeIndex = incoming.activeIndex; focusedIndex = incoming.focusedIndex;
-            sortMode = incoming.sortMode; lastQueryTerms = incoming.lastQueryTerms; lastSearchIncludedDiscussion = incoming.lastSearchIncludedDiscussion;
-            searchMode = incoming.searchMode;
-        } else {
-            results = []; currentPage = 1; activeIndex = -1; focusedIndex = -1;
-            lastQueryTerms = []; lastSearchIncludedDiscussion = false;
-            sortMode = "recent"; searchMode = bucket === "stats" ? "stats" : "terms";
-        }
-        if (ui.sortSelect) ui.sortSelect.value = sortMode;
-        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
-
-        // A consulta ao vivo (sem GSE) pertence SÓ à aba Estatística: o que
-        // está em memória é o resultado dela, não o acervo indexado que as
-        // outras abas usam. Sair da aba levando isso junto mostraria, na
-        // Pesquisa por termos, a contagem e o gráfico de GSEs de uma consulta
-        // que não é dela. Então o resultado ao vivo é descartado ao sair.
-        if (liveQueryMode && bucket !== "stats") {
-            archive = [];
-            liveQueryMode = false;
-            loadedSignature = null; // a próxima pesquisa recarrega o acervo certo
-            // A seleção NÃO zera aqui: itens marcados durante a consulta ao
-            // vivo continuam guardados em selectedRecords e podem ser
-            // exportados depois, mesmo com o `archive` descartado acima.
-            updateSelectionUi();
-            renderStats();
-            renderIndexStatus();
-        }
-
-        // A mensagem de status também é por aba: sem isto, a contagem da
-        // pesquisa anterior continuava na tela depois de trocar de aba.
-        setStatus(results.length
-            ? `${results.length.toLocaleString("pt-BR")} resultado(s) desta aba.`
-            : (archive.length ? "" : "Escolha os filtros e pesquise."), results.length ? "success" : "info");
-
-        renderResults();
-    }
-
     // ============================================================
     // RENDERIZAÇÃO DE RESULTADOS
     // ============================================================
@@ -5910,8 +5819,9 @@
 
     function renderResults() {
         ui.results.innerHTML = "";
-        ui.statsViewToggle.hidden = searchMode !== "stats";
-        ui.cardStyleToggle.hidden = searchMode === "stats";
+        ui.statsViewToggle.hidden = false;
+        // O estilo dos blocos de texto só existe na visão de cartões.
+        ui.cardStyleToggle.hidden = viewMode !== "cards";
         if (!results.length) {
             ui.results.innerHTML = loadingProgressInfo
                 ? '<div class="empty">Carregando os resultados mais recentes primeiro...</div>'
@@ -5933,8 +5843,8 @@
         if (pageItems.some(needsHydration)) {
             hydrateItems(pageItems).then(changed => { if (changed) renderResults(); });
         }
-        if (searchMode === "stats") renderStatsResults(pageItems, start);
-        else renderDetailedResults(pageItems, start);
+        if (viewMode === "cards") renderDetailedResults(pageItems, start);
+        else renderStatsResults(pageItems, start);
         renderLoadingTrickleFooter();
         ui.pagination.hidden = pages <= 1;
         ui.pageInfo.textContent = `Página ${currentPage} de ${pages} · ${results.length.toLocaleString("pt-BR")} resultado(s)`;
@@ -6008,14 +5918,19 @@
         tr.className = globalIndex === activeIndex ? "active" : "";
         tr.dataset.index = String(globalIndex);
         const url = `${location.origin}/saw/Request/${encodeURIComponent(item.id)}/general`;
+        const occurrences = lastQueryTerms.length ? countOccurrences(item) : 0;
         tr.innerHTML = `
             <td><input type="checkbox" class="row-select" ${isSelected(item.id) ? "checked" : ""}></td>
             <td class="stats-previewable"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.id)}</a><div class="stats-tip">${escapeHtml(truncatePreview(item.description, 220))}</div></td>
             <td>${escapeHtml(formatDate(item.created))}</td>
             <td><span class="gse-tag">${escapeHtml(item.groupName)}</span></td>
+            <td class="stats-cell-wrap">${escapeHtml(item.unidade || "—")}</td>
+            <td class="stats-cell-wrap">${escapeHtml(STATUS_LABELS[item.status] || item.status || "—")}</td>
+            <td class="stats-cell-wrap">${escapeHtml(STATUS_OPERACIONAL_LABELS[item.statusOperacional] || item.statusOperacional || "—")}</td>
             <td>${escapeHtml(item.assignedSpecialist)}</td>
             <td>${escapeHtml(item.requestedFor)}</td>
             <td>${item.isVip ? '<span class="vip-dot">★</span>' : ""}</td>
+            ${lastQueryTerms.length ? `<td class="stats-occ">${occurrences ? occurrences.toLocaleString("pt-BR") : ""}</td>` : ""}
             <td><button class="icon-btn expand-one" type="button" title="Expandir"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg></button></td>`;
         wireStatsItemEvents(tr, item, globalIndex);
         return tr;
@@ -6037,6 +5952,8 @@
             <div class="stats-tile-mini">
                 <div><small>Criado</small>${escapeHtml(formatDate(item.created))}</div>
                 <div><small>GSE</small>${escapeHtml(item.groupName)}</div>
+                <div><small>Unidade</small>${escapeHtml(item.unidade || "—")}</div>
+                <div><small>Status</small>${escapeHtml(STATUS_LABELS[item.status] || item.status || "—")}</div>
                 <div><small>Especialista</small>${escapeHtml(item.assignedSpecialist)}</div>
                 <div><small>Solicitante</small>${escapeHtml(item.requestedFor)}</div>
             </div>`;
@@ -6046,19 +5963,22 @@
 
     function renderStatsResults(pageItems, start) {
         const fragment = document.createDocumentFragment();
-        if (statsViewMode === "grid") {
+        if (viewMode === "grid") {
             const grid = document.createElement("div");
             grid.className = "stats-tile-grid";
             pageItems.forEach((item, localIndex) => grid.appendChild(buildStatsTile(item, start + localIndex)));
             fragment.appendChild(grid);
         } else {
+            const wrap = document.createElement("div");
+            wrap.className = "stats-table-wrap";
             const table = document.createElement("table");
             table.className = "stats-table";
-            table.innerHTML = "<thead><tr><th></th><th>Nº</th><th>Criado em</th><th>GSE</th><th>Especialista</th><th>Solicitante</th><th>VIP</th><th></th></tr></thead>";
+            table.innerHTML = `<thead><tr><th></th><th>Nº</th><th>Criado em</th><th>GSE</th><th>Unidade</th><th>Status</th><th>Status oper.</th><th>Especialista</th><th>Solicitante</th><th>VIP</th>${lastQueryTerms.length ? "<th title=\"Ocorrências dos termos pesquisados\">Ocorr.</th>" : ""}<th></th></tr></thead>`;
             const tbody = document.createElement("tbody");
             pageItems.forEach((item, localIndex) => tbody.appendChild(buildStatsRow(item, start + localIndex)));
             table.appendChild(tbody);
-            fragment.appendChild(table);
+            wrap.appendChild(table);
+            fragment.appendChild(wrap);
         }
         ui.results.appendChild(fragment);
     }
@@ -6864,7 +6784,6 @@
             .stats-row .control { max-width: 280px; flex: 1; min-width: 200px; }
             .stats-row .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
             .stats-row .control select { width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); }
-            .stats-search { height: 36px; padding: 0 18px; border: none; border-radius: 6px; background: var(--v-accent); color: #fff; font-weight: 700; font-size: 12.5px; cursor: pointer; }
             .stats-fixed { margin-bottom: 14px; }
             .stats-fixed .panel { background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; padding: 13px; }
             .stats-tag-title { font-size: 10.5px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 8px; }
@@ -6872,6 +6791,10 @@
             .stats-tag { height: 30px; padding: 0 13px; border-radius: 99px; border: 1.5px solid var(--v-accent); color: var(--v-accent); background: var(--v-panel); font-size: 12px; font-weight: 700; cursor: pointer; }
             .stats-tag.active { background: var(--v-accent); color: #fff; border-color: transparent; }
             .stats-tag-fields { display: flex; flex-wrap: wrap; gap: 14px; }
+            .gse-surface { margin-top: 12px; }
+            .gse-surface .panel { padding: 11px 13px; }
+            .gse-surface .gse-list { max-height: 104px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+
             .stats-tag-slot { margin-top: 12px; min-width: 240px; display: flex; gap: 12px; flex-wrap: wrap; }
             .stats-tag-slot .control { flex: 1; min-width: 200px; }
             .stats-tag-slot[hidden] { display: none; }
@@ -6914,7 +6837,10 @@
                aparecendo no meio da lista, por cima das linhas. Rolando junto com
                o conteúdo o problema simplesmente não existe. border-spacing zero
                fica porque o visual com bordas separadas é idêntico. */
-            .stats-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+            .stats-table { width: 100%; min-width: 900px; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+            .stats-table-wrap { overflow-x: auto; }
+            .stats-cell-wrap { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .stats-occ { text-align: right; font-variant-numeric: tabular-nums; color: var(--v-accent); font-weight: 700; }
             .stats-table th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: var(--v-muted); font-weight: 800; padding: 7px 10px; border-bottom: 1px solid var(--v-panel-border); background: var(--v-page); }
             .stats-table td { padding: 9px 10px; border-bottom: 1px solid var(--v-panel-border); color: var(--v-text-2); vertical-align: middle; }
             .stats-table tr:hover td { background: var(--v-accent-soft); }
@@ -7419,6 +7345,28 @@
                     </div>
                     <div class="query-validator" hidden></div>
                 </div>
+                <div class="gse-surface">
+                    <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
+                            <p class="stats-tag-title team-pills-title" id="gseTeamsTitle" hidden>Minhas equipes</p>
+                            <div class="team-pills" id="gseTeams"></div>
+                            <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
+                            <div class="gse-list"></div>
+                            <div class="extra-gse-block">
+                                <p class="stats-tag-title" style="margin-top:10px">Outras GSEs</p>
+                                <div class="combo" id="extraGseCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar GSEs...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Ex.: sti, gmud, aciv..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                                <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
+                            </div>
+                            <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
+                        </section>
+                </div>
                 <div class="stats-mode">
                     <div class="prefs-block">
                         <p class="stats-tag-title">Preferências</p>
@@ -7511,7 +7459,7 @@
                 <div class="advanced-toggle-wrap">
                     <button class="btn btn-secondary advanced-toggle" type="button" aria-expanded="false">Filtros avançados<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></button>
                     <div class="advanced-panel" hidden>
-                        <section class="panel"><h3>Pessoas</h3><div class="people-grid">
+                        <section class="panel" style="grid-column:1/-1"><h3>Pessoas</h3><div class="people-grid">
                             <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label>
                                 <div class="person-multi" id="requestedForCombo">
                                     <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
@@ -7556,26 +7504,6 @@
                                 <div class="control solution-date-days-wrap" hidden><label>Dias corridos</label><input class="solution-date-days" type="number" min="1" placeholder="Ex.: 7"></div>
                             </div>
                         </div>
-                        </section>
-                        <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
-                            <p class="stats-tag-title team-pills-title" id="gseTeamsTitle" hidden>Minhas equipes</p>
-                            <div class="team-pills" id="gseTeams"></div>
-                            <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
-                            <div class="gse-list"></div>
-                            <div class="extra-gse-block">
-                                <p class="stats-tag-title" style="margin-top:10px">Outras GSEs</p>
-                                <div class="combo" id="extraGseCombo">
-                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar GSEs...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
-                                    <div class="combo-panel">
-                                        <div class="combo-search"><input type="text" placeholder="Ex.: sti, gmud, aciv..."></div>
-                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
-                                        <div class="combo-options"></div>
-                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
-                                    </div>
-                                </div>
-                                <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
-                            </div>
-                            <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Triagem por termo (2ª passada, sobre o resultado)</h3>
                             <small class="person-hint">Roda DEPOIS da busca, sobre o que ela devolveu. Diferente do termo lá de cima, aqui os campos marcados viram um texto só — então "não pode conter" descarta o chamado mesmo quando o termo indesejado aparece num campo diferente daquele que o trouxe para o resultado. Sem consultar o SMAX.</small>
@@ -7677,11 +7605,12 @@
                 <span class="selection-count"></span>
                 <button class="tiny clear-selection" type="button" hidden>Limpar seleção</button>
                 <button class="tiny open-selected" type="button" disabled>Abrir selecionadas</button>
-                <div class="stats-view-toggle" hidden>
+                <div class="stats-view-toggle">
                     <button type="button" class="view-btn active" data-view="table" title="Ver como tabela"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"></path></svg></button>
                     <button type="button" class="view-btn" data-view="grid" title="Ver como grade"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7"></rect><rect x="13" y="4" width="7" height="7"></rect><rect x="4" y="13" width="7" height="7"></rect><rect x="13" y="13" width="7" height="7"></rect></svg></button>
+                    <button type="button" class="view-btn" data-view="cards" title="Ver como cartões (Descrição/Solução/Discussão à vista)"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="2"></rect><rect x="4" y="14" width="16" height="6" rx="2"></rect></svg></button>
                 </div>
-                <div class="card-style-toggle">
+                <div class="card-style-toggle" hidden>
                     <button type="button" class="view-btn active" data-card-style="3b" title="Descrição/Solução/Discussão com fundo preenchido"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3" fill="currentColor" stroke="none"></rect></svg></button>
                     <button type="button" class="view-btn" data-card-style="3d" title="Descrição/Solução/Discussão só com barra colorida no topo"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="M4.8 4h14.4" stroke-width="3.5"></path></svg></button>
                 </div>
@@ -7689,7 +7618,7 @@
             </nav>
             <div class="progress" hidden><div class="progress-text"></div><div class="track"><div class="fill"></div></div></div>
             <div class="status"></div>
-            <main class="results"><div class="empty">Carregue o acervo completo e pesquise.</div></main>
+            <main class="results"><div class="empty">Marque as GSEs e o período e clique em "Pesquisar no acervo". O termo é opcional: sem ele, o levantamento sai só pelos filtros.</div></main>
             <footer class="pagination" hidden><button class="prev-page">Anterior</button><span class="page-info"></span><button class="next-page">Próxima</button></footer>
             <div class="focus-overlay" hidden><div class="focus-body"></div></div>
             <div class="export-opts-overlay" hidden>
@@ -7836,7 +7765,6 @@
             advancedToggleWrap: shadow.querySelector(".advanced-toggle-wrap"), advancedToggle: shadow.querySelector(".advanced-toggle"), advancedPanel: shadow.querySelector(".advanced-panel"),
             requestedForComboRoot: shadow.getElementById("requestedForCombo"), specialistComboRoot: shadow.getElementById("specialistCombo"), vipOnly: shadow.querySelector(".vip-only"), globalOnly: shadow.querySelector(".global-only"),
             statusComboRoot: shadow.getElementById("statusCombo"), statusOperacionalComboRoot: shadow.getElementById("statusOperacionalCombo"), unidadeComboRoot: shadow.getElementById("unidadeCombo"),
-            statsSearch: shadow.querySelector(".stats-search"),
             requestedForExcludeComboRoot: shadow.getElementById("requestedForExcludeCombo"), specialistExcludeComboRoot: shadow.getElementById("specialistExcludeCombo"),
             unidadeExcludeComboRoot: shadow.getElementById("unidadeExcludeCombo"),
             triageInclude: shadow.querySelector(".triage-include"), triageExclude: shadow.querySelector(".triage-exclude"), triageClear: shadow.querySelector(".triage-clear"),
@@ -8153,13 +8081,13 @@
         ui.mode.addEventListener("change", renderQueryValidator);
         // Tela única: não há mais abas. A busca (com ou sem termo) e todos os
         // filtros vivem no mesmo fluxo; o botão "Pesquisar" resolve os dois.
-        try { const savedView = localStorage.getItem(STATS_VIEW_STORAGE_KEY); if (savedView === "grid" || savedView === "table") statsViewMode = savedView; } catch (_) {}
+        try { const savedView = localStorage.getItem(STATS_VIEW_STORAGE_KEY); if (["table", "grid", "cards"].includes(savedView)) viewMode = savedView; } catch (_) {}
         ui.statsViewToggle.querySelectorAll(".view-btn").forEach(btn => {
-            if (btn.dataset.view === statsViewMode) btn.classList.add("active"); else btn.classList.remove("active");
+            if (btn.dataset.view === viewMode) btn.classList.add("active"); else btn.classList.remove("active");
             btn.addEventListener("click", () => {
-                statsViewMode = btn.dataset.view;
+                viewMode = btn.dataset.view;
                 ui.statsViewToggle.querySelectorAll(".view-btn").forEach(b => b.classList.toggle("active", b === btn));
-                try { localStorage.setItem(STATS_VIEW_STORAGE_KEY, statsViewMode); } catch (_) {}
+                try { localStorage.setItem(STATS_VIEW_STORAGE_KEY, viewMode); } catch (_) {}
                 renderResults();
             });
         });
@@ -8177,55 +8105,6 @@
             });
         });
 
-        // Na aba Estatística, GSE e Período saem do painel "Filtros
-        // avançados" e ficam fixos na tela (você não roda essa busca sem
-        // eles); Especialista/Solicitante/VIP viram tags — o campo continua
-        // sendo o MESMO elemento (autocomplete e tudo), só muda de lugar na
-        // tela. Ao sair da aba, tudo volta pro lugar de origem.
-        const statsRelocatable = ["filterGseSection", "filterSpecialistControl", "filterRequestedForControl"];
-        const statsOriginalSpot = new Map();
-        function moveIntoStats() {
-            const target = { filterGseSection: "statsGseSlot", filterSpecialistControl: "statsEspSlot", filterRequestedForControl: "statsSolSlot" };
-            statsRelocatable.forEach(id => {
-                const el = shadow.getElementById(id);
-                if (!el || statsOriginalSpot.has(id)) return;
-                statsOriginalSpot.set(id, { parent: el.parentNode, next: el.nextSibling });
-                shadow.getElementById(target[id]).appendChild(el);
-            });
-            // "Buscar em"/"Qualquer palavra"/"Filtros avançados" só fazem
-            // sentido pra busca por texto — na Estatística ficam escondidos
-            // (os filtros dela já estão todos fixos ou em tag na própria aba).
-            ui.fieldChecks.hidden = true;
-            ui.mode.hidden = true;
-            ui.advancedToggleWrap.hidden = true;
-            ui.loadButton.hidden = true;
-            // Buscar sem GSE só existe aqui: as outras abas fazem busca textual,
-            // que depende do acervo indexado — e indexar é ancorado em GSE.
-            ui.ignoreGseWrap.hidden = false;
-            // "Mais ocorrências" só existe quando há texto pesquisado — a
-            // Estatística não busca texto nenhum.
-            shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = true; });
-            if (sortMode === "relevance") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
-        }
-        function restoreFromStats() {
-            statsRelocatable.forEach(id => {
-                const spot = statsOriginalSpot.get(id);
-                const el = shadow.getElementById(id);
-                if (!spot || !el) return;
-                if (spot.next && spot.next.parentNode === spot.parent) spot.parent.insertBefore(el, spot.next);
-                else spot.parent.appendChild(el);
-                statsOriginalSpot.delete(id);
-            });
-            ui.fieldChecks.hidden = false;
-            ui.mode.hidden = false;
-            ui.advancedToggleWrap.hidden = false;
-            ui.loadButton.hidden = false;
-            // Só esconde. Desmarcar fica por conta de swapFilterState, que roda
-            // depois — desmarcar aqui apagaria o estado antes de ele ser
-            // guardado, e a Estatística esqueceria a opção ao voltar.
-            ui.ignoreGseWrap.hidden = true;
-            shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = false; });
-        }
         shadow.querySelectorAll(".stats-tag").forEach(tag => {
             tag.addEventListener("click", () => {
                 const slot = shadow.getElementById(tag.dataset.slot);
