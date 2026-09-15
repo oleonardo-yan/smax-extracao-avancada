@@ -1314,6 +1314,67 @@
     // Cada campo aceita várias pessoas (OU entre elas, mesma lógica das GSEs/
     // Status/Unidade); os dois campos entre si continuam em E. Vazio =
     // comportamento de sempre (carrega tudo das GSEs selecionadas).
+    // ÂNCORA POR UNIDADE/COMARCA (consulta sem GSE)
+    // ---------------------------------------------
+    // Sem GSE, a consulta precisa de alguma âncora estruturada que o SMAX
+    // aceite filtrar — senão ela varreria o acervo inteiro. Além de pessoa,
+    // agora vale Unidade/Comarca, via RegisteredForLocation (referência, como
+    // AssignedToGroup).
+    //
+    // Duas armadilhas que este bloco existe para evitar:
+    // 1. O combo de unidade trabalha com o NOME (DisplayName) e o mesmo nome
+    //    pode corresponder a VÁRIAS entidades Location. Filtrar por um Id só
+    //    traria menos chamados do que o filtro local pelo nome — perda de
+    //    cobertura sem aviso. Por isso a âncora é o OU de TODOS os Ids que
+    //    têm aquele nome, resolvidos na hora contra o SMAX.
+    // 2. A cláusula vale SÓ na consulta ao vivo (sem GSE), que não é salva em
+    //    disco. Se ela também restringisse uma carga normal por GSE, o índice
+    //    gravaria "esta GSE, este período" com um pedaço faltando e as
+    //    próximas sessões achariam que já tinham tudo.
+    let locationAnchorIds = []; // Ids de Location da carga ao vivo atual — vazio em carga normal por GSE
+
+    async function fetchLocationIds(name) {
+        const words = String(name || "").split(/\s+/).filter(Boolean).slice(0, 4);
+        if (!words.length) return [];
+        const wordClauses = words.map(word => `(LocationDetails wordstartswith ('${word.replace(/'/g, "''")}'))`).join(" and ");
+        const params = new URLSearchParams({
+            filter: `((Active = 'true' or Active = null) and (${wordClauses}))`,
+            layout: "Id,DisplayName", order: "DisplayName asc", size: "200"
+        });
+        const payload = await fetchJson(`${getRestBase()}/ems/Location?${params}`);
+        const target = normalize(name, true, true);
+        return (Array.isArray(payload.entities) ? payload.entities : [])
+            .filter(entity => normalize(String((entity.properties || {}).DisplayName || ""), true, true) === target)
+            .map(entity => String((entity.properties || {}).Id || ""))
+            .filter(Boolean);
+    }
+
+    // Resolve (ou limpa) a âncora de unidade antes da carga. Sempre consulta o
+    // SMAX em vez de reaproveitar o que o combo mostrou: a busca do combo é
+    // limitada a 100 resultados e deduplicada por nome, então o que está na
+    // tela pode não ser a lista completa de Ids daquele nome.
+    async function resolveLocationAnchor() {
+        locationAnchorIds = [];
+        if (!ignoringGse() || !ui.unidadeCombo) return;
+        const names = ui.unidadeCombo.getSelected().map(option => option.value);
+        if (!names.length) return;
+        const found = new Set();
+        for (const name of names) {
+            (await fetchLocationIds(name)).forEach(id => found.add(id));
+        }
+        locationAnchorIds = Array.from(found);
+        if (!locationAnchorIds.length) {
+            throw new Error(`Não foi possível identificar "${names.join('", "')}" nas unidades do SMAX — sem isso a consulta sem GSE varreria o acervo inteiro. Escolha a unidade de novo pela lista de sugestões.`);
+        }
+    }
+
+    function locationConstraintClause() {
+        if (!locationAnchorIds.length) return "";
+        return locationAnchorIds.length === 1
+            ? `RegisteredForLocation = '${locationAnchorIds[0]}'`
+            : `(${locationAnchorIds.map(id => `RegisteredForLocation = '${id}'`).join(" or ")})`;
+    }
+
     function personIdClause(fieldName, ids) {
         if (!ids.length) return "";
         return ids.length === 1 ? `${fieldName} = '${ids[0]}'` : `(${ids.map(id => `${fieldName} = '${id}'`).join(" or ")})`;
@@ -1374,6 +1435,8 @@
         }
         const extra = personConstraintClause();
         if (extra) parts.push(`(${extra})`);
+        const location = locationConstraintClause();
+        if (location) parts.push(`(${location})`);
         return parts.join(" and ");
     }
 
@@ -1666,9 +1729,11 @@
             periodMode === "between" ? `entre ${ui.dateFrom.value || "?"} e ${ui.dateTo.value || "?"}` : "";
         const specialistNames = ui.specialistCombo ? ui.specialistCombo.getSelected().map(o => o.label) : [];
         const requesterNames = ui.requestedForCombo ? ui.requestedForCombo.getSelected().map(o => o.label) : [];
+        const unidadeNames = ignoringGse() && ui.unidadeCombo ? ui.unidadeCombo.getSelected().map(o => o.label) : [];
         const loadNote = [
             specialistNames.length ? `Designado Especialista: ${specialistNames.join(", ")}` : "",
             requesterNames.length ? `Solicitado para: ${requesterNames.join(", ")}` : "",
+            unidadeNames.length ? `Unidade/Comarca: ${unidadeNames.join(", ")}` : "",
             periodNote ? `período: ${periodNote}` : ""
         ].filter(Boolean).join(" · ");
         setStatus(loadNote ? `Planejando carga por período (restrito a ${loadNote})...` : "Planejando carga por período (mais recente primeiro)...", "info");
@@ -1678,8 +1743,26 @@
             const semGse = ignoringGse();
             const groupIds = semGse ? [] : selectedGseIds();
             if (!semGse && !groupIds.length) throw new Error("Selecione ao menos um GSE no painel de filtros.");
-            if (semGse && !hasResolvedPersonFilter()) {
-                throw new Error('Com "Ignorar GSE" marcado, escolha uma pessoa em Solicitado para ou Designado Especialista (selecionando uma sugestão da lista).');
+            if (semGse && !hasLiveQueryAnchor()) {
+                throw new Error('Com "Ignorar GSE" marcado, escolha uma pessoa (Solicitado para / Designado Especialista) ou uma Unidade/Comarca — selecionando uma sugestão da lista, para o filtro ir ao servidor.');
+            }
+            await resolveLocationAnchor();
+            // Filtrar por RegisteredForLocation é o ponto desta carga que não dá
+            // para conferir sem o SMAX na frente. Uma sondagem barata (contagem
+            // de um dia) diz se o servidor aceita a cláusula: se não aceitar,
+            // a carga PARA aqui. Seguir em frente varreria o acervo inteiro sem
+            // a restrição que o usuário pediu — e o número sairia errado sem
+            // ninguém perceber.
+            if (semGse && locationAnchorIds.length) {
+                const probeTo = Date.now();
+                const probeFrom = probeTo - 86400000;
+                try {
+                    await fetchFilterCount(windowClause([], probeFrom, probeTo));
+                } catch (error) {
+                    if (!isExceededError(error)) {
+                        throw new Error(`O SMAX não aceitou filtrar por Unidade/Comarca na consulta sem GSE (${error.message || error}). Use Solicitado para / Designado Especialista como critério, ou volte a marcar GSEs.`);
+                    }
+                }
             }
             const loadRange = computeLoadDateRange();
             let splitRangeFrom = loadRange.from != null ? loadRange.from : ARCHIVE_EARLIEST_TIME;
@@ -1979,6 +2062,11 @@
             }
         } catch (error) {
             setStatus(error.message || String(error), "error");
+            // A assinatura é gravada antes da carga começar; se ela falhou, o
+            // que está em memória é o acervo ANTERIOR. Sem zerar isto, a
+            // próxima pesquisa acharia que já tem o que foi pedido e
+            // responderia com os dados antigos, sem avisar.
+            loadedSignature = null;
         } finally {
             // Antes só re-habilitava Pesquisar/Buscar semelhantes no caminho
             // de sucesso — se você cancelava, ficavam travados pra sempre
@@ -2863,6 +2951,13 @@
         return !!((ui.specialistCombo && ui.specialistCombo.getSelected().length) || (ui.requestedForCombo && ui.requestedForCombo.getSelected().length));
     }
 
+    // Âncoras válidas para a consulta sem GSE: pessoa ou unidade. Status e
+    // período não entram — "todos os concluídos" ou "todos de um mês" é
+    // praticamente o acervo inteiro, e nenhuma bisseção salva isso.
+    function hasLiveQueryAnchor() {
+        return hasResolvedPersonFilter() || !!(ui.unidadeCombo && ui.unidadeCombo.getSelected().length);
+    }
+
     function selectedGseIds() {
         const base = Array.from(ui.gseList.querySelectorAll("input[data-gse]:checked")).map(input => input.value);
         const extra = ui.extraGseCombo ? ui.extraGseCombo.getSelected().map(option => option.value) : [];
@@ -2880,9 +2975,12 @@
         const gseIds = ignoringGse() ? "SEM-GSE" : selectedGseIds().slice().sort().join(",");
         const specialistId = ui.specialistCombo ? ui.specialistCombo.getSelected().map(o => o.value).sort().join(",") : "";
         const requesterId = ui.requestedForCombo ? ui.requestedForCombo.getSelected().map(o => o.value).sort().join(",") : "";
+        // Só na consulta ao vivo: em carga por GSE a unidade é filtro local e
+        // não muda nada do que vem do servidor.
+        const unidade = ignoringGse() && ui.unidadeCombo ? ui.unidadeCombo.getSelected().map(o => o.value).sort().join(",") : "";
         const discussion = ui.fieldDiscussion.checked ? "1" : "0";
         const period = `${ui.dateMode.value}|${ui.dateDays.value}|${ui.dateFrom.value}|${ui.dateTo.value}`;
-        return `${gseIds}|${specialistId}|${requesterId}|${discussion}|${period}`;
+        return `${gseIds}|${specialistId}|${requesterId}|${unidade}|${discussion}|${period}`;
     }
 
     // Chamado no início de "Pesquisar"/"Buscar casos semelhantes" — só
@@ -7629,7 +7727,7 @@
                                 </div>
                                 <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
                             </div>
-                            <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
+                            <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para, Designado Especialista ou Unidade/Comarca (escolhidos na lista de sugestões). O resultado não é salvo em disco.</small></span></label>
                             </details>
                         </section>
                 </div>
