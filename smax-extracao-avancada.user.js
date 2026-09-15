@@ -3397,6 +3397,98 @@
         });
     }
 
+    // Inverso de multiValueMatches: nada marcado = sem restrição; se o valor
+    // do item bate com QUALQUER um dos marcados, o item cai fora. Existe porque
+    // Unidade/Comarca e pessoas têm domínio grande demais para "selecionar
+    // todas menos duas" ser viável na mão — excluir é o único caminho prático.
+    function multiValueExcludes(itemValue, selectedOptions, ignoreCase, ignoreAccents) {
+        if (!selectedOptions || !selectedOptions.length) return true;
+        const normalizedItem = normalize(itemValue, ignoreCase, ignoreAccents);
+        return !selectedOptions.some(option => normalize(option.value, ignoreCase, ignoreAccents) === normalizedItem);
+    }
+
+    // ============================================================
+    // TRIAGEM POR TERMO (Descrição / Solução / Discussão) — 2ª passada
+    // ============================================================
+    // Diferente do termo da busca: ali o texto é casado campo A campo (basta
+    // bater em UM dos campos marcados). Aqui os campos marcados viram um texto
+    // só, então "não pode conter" pega o termo indesejado mesmo quando ele
+    // aparece num campo diferente daquele que trouxe o chamado para o
+    // resultado — que é justamente o caso que a busca principal não resolve
+    // sozinha (ex.: achar "automação" na Descrição e descartar quem menciona
+    // "homologação" na Solução).
+    function parseTermList(text) {
+        return String(text || "")
+            .split(/[\n,;]+/)
+            .map(part => part.trim())
+            .filter(Boolean);
+    }
+
+    function triageFields() {
+        if (!host || !host.shadowRoot) return [];
+        return Array.from(host.shadowRoot.querySelectorAll(".triage-field:checked")).map(el => el.value);
+    }
+
+    function triageTerms() {
+        return {
+            include: parseTermList(ui.triageInclude ? ui.triageInclude.value : ""),
+            exclude: parseTermList(ui.triageExclude ? ui.triageExclude.value : "")
+        };
+    }
+
+    function textTriageMatches(texts, includeTerms, excludeTerms, fields) {
+        const blob = normalize(fields.map(f => texts[f] || "").join("\n"), true, true);
+        if (includeTerms.length && !includeTerms.some(term => blob.includes(normalize(term, true, true)))) return false;
+        if (excludeTerms.length && excludeTerms.some(term => blob.includes(normalize(term, true, true)))) return false;
+        return true;
+    }
+
+    // Roda a triagem sobre uma lista de registros. O texto que já mora só no
+    // disco é lido em blocos e descartado em seguida (guarda só o veredito por
+    // id), pelo mesmo motivo do refinamento: a extração pode ter dezenas de
+    // milhares de chamados e não pode trazer o corpus todo pra RAM.
+    async function filterByTextTriage(items, includeTerms, excludeTerms, fields) {
+        const keep = new Set();
+        const pending = [];
+        items.forEach(item => {
+            if (needsHydration(item)) pending.push(item);
+            else if (textTriageMatches(item, includeTerms, excludeTerms, fields)) keep.add(item.id);
+        });
+        for (let start = 0; start < pending.length; start += 400) {
+            const slice = pending.slice(start, start + 400);
+            const stored = await db.texts.bulkGet(slice.map(item => item.id));
+            stored.forEach((row, index) => {
+                const texts = {
+                    description: (row && row.description) || "",
+                    solution: (row && row.solution) || "",
+                    discussion: (row && row.discussion) || ""
+                };
+                if (textTriageMatches(texts, includeTerms, excludeTerms, fields)) keep.add(slice[index].id);
+            });
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        return items.filter(item => keep.has(item.id));
+    }
+
+    // Erros de preenchimento da triagem, como texto pronto — ou null se está
+    // tudo certo. Vale para a busca e para o refinamento, que compartilham os
+    // mesmos campos.
+    function triageProblem() {
+        const { include, exclude } = triageTerms();
+        if (!include.length && !exclude.length) return null;
+        const fields = triageFields();
+        if (!fields.length) return 'Marque ao menos um campo (Descrição/Solução/Discussão) na triagem por termo.';
+        if (fields.includes("discussion") && !archiveIncludesDiscussion) {
+            // Triar por um campo que nunca foi carregado devolveria "zero" como
+            // se fosse resposta — a falha silenciosa que esta ferramenta não
+            // pode ter.
+            return 'A carga atual não trouxe a Discussão — desmarque "Discussão" na triagem por termo ou recarregue o acervo com ela marcada.';
+        }
+        const overlap = include.filter(t => exclude.some(e => normalize(e, true, true) === normalize(t, true, true)));
+        if (overlap.length) return `O mesmo termo não pode estar em "deve conter" e em "não pode conter" ao mesmo tempo: ${overlap.join(", ")}.`;
+        return null;
+    }
+
     function advancedFiltersMatch(item) {
         const ignoreCase = ui.ignoreCase.checked;
         const ignoreAccents = ui.ignoreAccents.checked;
@@ -3407,6 +3499,9 @@
         if (ui.statusCombo && !multiValueMatches(item.status, ui.statusCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
         if (ui.statusOperacionalCombo && !multiValueMatches(item.statusOperacional, ui.statusOperacionalCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
         if (ui.unidadeCombo && !multiValueMatches(item.unidade, ui.unidadeCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.unidadeExcludeCombo && !multiValueExcludes(item.unidade, ui.unidadeExcludeCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.requestedForExcludeCombo && !multiValueExcludes(item.requestedForId, ui.requestedForExcludeCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.specialistExcludeCombo && !multiValueExcludes(item.assignedSpecialistId, ui.specialistExcludeCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
         if (!dateFilterMatches(item.created, ui.dateMode.value, ui.dateDays.value, ui.dateFrom.value, ui.dateTo.value)) return false;
         if (ui.solutionDateMode && !dateFilterMatches(item.solutionDate, ui.solutionDateMode.value, ui.solutionDateDays.value, ui.solutionDateFrom.value, ui.solutionDateTo.value)) return false;
         return true;
@@ -4046,6 +4141,25 @@
         if (anyMissing) loadedSignature = null;
     }
 
+    // Triagem por termo aplicada ao RESULTADO da busca, antes do filtro de
+    // histórico (que é o caro, porque consulta o SMAX chamado a chamado).
+    async function maybeApplyTextTriage() {
+        const { include, exclude } = triageTerms();
+        if (!include.length && !exclude.length) return;
+        const fields = triageFields();
+        const before = results.length;
+        setStatus(`Aplicando a triagem por termo em ${before.toLocaleString("pt-BR")} resultado(s)...`, "info");
+        results = await filterByTextTriage(results, include, exclude, fields);
+        currentPage = 1;
+        applySort();
+        activeIndex = results.length ? 0 : -1;
+        renderStats(results);
+        setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) após a triagem por termo (de ${before.toLocaleString("pt-BR")} antes dela).`, results.length ? "success" : "warning");
+        focusedIndex = -1;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        renderResults();
+    }
+
     async function maybeApplyHistoryGseFilter() {
         if (!ui.historyGseCombo) return;
         const selected = ui.historyGseCombo.getSelected();
@@ -4078,12 +4192,15 @@
             // texto por cima dos mesmos filtros. Em ambos os casos os filtros
             // estruturados (advancedFiltersMatch) valem — quem decide é só se
             // há ou não texto a casar.
+            const triageError = triageProblem();
+            if (triageError) { setStatus(triageError, "error"); return; }
             const hasTerm = ui.query.value.trim() !== "";
             if (!hasTerm) {
                 searchMode = "stats";
                 await ensureArchiveLoaded(() => applyStatsFilter(true));
                 if (!archive.length) return;
                 applyStatsFilter(false);
+                await maybeApplyTextTriage();
                 await maybeApplyHistoryGseFilter();
                 return;
             }
@@ -4094,6 +4211,7 @@
             if (!archive.length) return;
             if (indexReady) await applyTermSearchIndexed(prepared, false);
             else applyTermSearch(prepared, false);
+            await maybeApplyTextTriage();
             await maybeApplyHistoryGseFilter();
         } catch (error) {
             setStatus(error.message || String(error), "error");
@@ -4437,6 +4555,8 @@
     async function applyRefinement() {
         const snap = findSnapshot(refineBaseId);
         if (!snap) { setStatus('Escolha um recorte em "Basear-se em" antes de refinar.', "warning"); return; }
+        const triageError = triageProblem();
+        if (triageError) { setStatus(triageError, "error"); return; }
         const rawQuery = ui.refineQuery.value;
         const hasTerm = rawQuery.trim() !== "";
         let prepared = null;
@@ -4461,6 +4581,8 @@
         }
         ui.refineApply.disabled = true;
         try {
+            const triage = triageTerms();
+            const triageOn = !!(triage.include.length || triage.exclude.length);
             // A lista de GSEs marcadas também vale como recorte aqui: no
             // refinamento ela não manda carregar nada, só restringe o que já
             // está congelado às GSEs escolhidas (desmarcar = tirar do recorte).
@@ -4470,10 +4592,14 @@
                 return advancedFiltersMatch(item);
             });
             let filtered = structural;
+            if (triageOn) {
+                setStatus(`Aplicando a triagem por termo em ${filtered.length.toLocaleString("pt-BR")} solicitação(ões) do recorte...`, "info");
+                filtered = await filterByTextTriage(filtered, triage.include, triage.exclude, triageFields());
+            }
             if (prepared) {
-                setStatus(`Refinando ${structural.length.toLocaleString("pt-BR")} solicitação(ões) pelo termo...`, "info");
-                const keep = await refineTextMatches(structural, prepared);
-                filtered = structural.filter(item => keep.has(item.id));
+                setStatus(`Refinando ${filtered.length.toLocaleString("pt-BR")} solicitação(ões) pelo termo...`, "info");
+                const keep = await refineTextMatches(filtered, prepared);
+                filtered = filtered.filter(item => keep.has(item.id));
             }
             userEngagedWithResults = false;
             results = filtered.map(r => Object.assign({}, r));
@@ -5142,6 +5268,9 @@
         if (ui.statusCombo && ui.statusCombo.getSelected().length) rows.push({ label: "Status", items: ui.statusCombo.getSelected().map(o => o.label) });
         if (ui.statusOperacionalCombo && ui.statusOperacionalCombo.getSelected().length) rows.push({ label: "Status operacional", items: ui.statusOperacionalCombo.getSelected().map(o => o.label) });
         if (ui.unidadeCombo && ui.unidadeCombo.getSelected().length) rows.push({ label: "Unidade/Comarca", items: ui.unidadeCombo.getSelected().map(o => o.label) });
+        if (ui.unidadeExcludeCombo && ui.unidadeExcludeCombo.getSelected().length) rows.push({ label: "Unidade/Comarca — excluída", items: ui.unidadeExcludeCombo.getSelected().map(o => o.label) });
+        if (ui.requestedForExcludeCombo && ui.requestedForExcludeCombo.getSelected().length) rows.push({ label: "Solicitado para — excluído", items: ui.requestedForExcludeCombo.getSelected().map(o => o.label) });
+        if (ui.specialistExcludeCombo && ui.specialistExcludeCombo.getSelected().length) rows.push({ label: "Designado especialista — excluído", items: ui.specialistExcludeCombo.getSelected().map(o => o.label) });
         if (ui.dateMode.value !== "any") {
             const text = describeDateFilterValue(ui.dateMode.value, ui.dateDays.value, ui.dateFrom.value, ui.dateTo.value);
             if (text) rows.push({ label: "Período (abertura)", items: [text] });
@@ -5152,6 +5281,10 @@
         }
         if (ui.vipOnly.checked) rows.push({ label: "Usuário VIP", items: ["Sim"] });
         if (ui.globalOnly && ui.globalOnly.checked) rows.push({ label: "Global", items: ["Sim"] });
+        const triageRowFields = triageFields().map(f => ({ description: "Descrição", solution: "Solução", discussion: "Discussão" })[f] || f);
+        const triageRowTerms = triageTerms();
+        if (triageRowTerms.include.length) rows.push({ label: `Triagem — deve conter (em ${triageRowFields.join("/") || "nenhum campo marcado"})`, items: triageRowTerms.include });
+        if (triageRowTerms.exclude.length) rows.push({ label: `Triagem — não pode conter (em ${triageRowFields.join("/") || "nenhum campo marcado"})`, items: triageRowTerms.exclude });
         if (ui.historyGseCombo && ui.historyGseCombo.getSelected().length) {
             const excludeLabel = ui.historyGseExclude && ui.historyGseExclude.checked ? "Não passou por GSE" : "Passou por GSE";
             rows.push({ label: excludeLabel, items: ui.historyGseCombo.getSelected().map(o => o.label) });
@@ -5696,6 +5829,8 @@
     const EMPTY_FILTERS = {
         specialistIds: [], requestedForIds: [],
         statusValues: [], statusOperacionalValues: [], unidadeValues: [],
+        unidadeExcludeValues: [], requestedForExcludeIds: [], specialistExcludeIds: [],
+        triageInclude: "", triageExclude: "",
         vipOnly: false, globalOnly: false, ignoreGse: false,
         dateMode: "days", dateFrom: "", dateTo: "", dateDays: "180"
     };
@@ -6241,7 +6376,17 @@
             requestedForIds: ui.requestedForCombo ? ui.requestedForCombo.getSelected() : [],
             statusValues: ui.statusCombo.getSelected(), statusOperacionalValues: ui.statusOperacionalCombo.getSelected(),
             unidadeValues: ui.unidadeCombo.getSelected(), vipOnly: ui.vipOnly.checked, globalOnly: ui.globalOnly ? ui.globalOnly.checked : false,
-            dateMode: ui.dateMode.value, dateFrom: ui.dateFrom.value, dateTo: ui.dateTo.value, dateDays: ui.dateDays.value
+            dateMode: ui.dateMode.value, dateFrom: ui.dateFrom.value, dateTo: ui.dateTo.value, dateDays: ui.dateDays.value,
+            // Excludentes e triagem entram aqui pelo mesmo motivo dos demais:
+            // aplicar uma preferência tem que deixar o estado INTEIRO igual ao
+            // de quando ela foi salva — uma exclusão esquecida de pé mudaria a
+            // contagem sem ninguém ver.
+            unidadeExcludeValues: ui.unidadeExcludeCombo ? ui.unidadeExcludeCombo.getSelected() : [],
+            requestedForExcludeIds: ui.requestedForExcludeCombo ? ui.requestedForExcludeCombo.getSelected() : [],
+            specialistExcludeIds: ui.specialistExcludeCombo ? ui.specialistExcludeCombo.getSelected() : [],
+            triageFields: triageFields(),
+            triageInclude: ui.triageInclude ? ui.triageInclude.value : "",
+            triageExclude: ui.triageExclude ? ui.triageExclude.value : ""
         };
     }
 
@@ -6278,6 +6423,15 @@
         ui.dateTo.value = filters.dateTo || "";
         ui.dateDays.value = filters.dateDays || "";
         updateDateControls();
+        if (ui.unidadeExcludeCombo) ui.unidadeExcludeCombo.setSelected(filters.unidadeExcludeValues || []);
+        if (ui.requestedForExcludeCombo) ui.requestedForExcludeCombo.setSelected(filters.requestedForExcludeIds || []);
+        if (ui.specialistExcludeCombo) ui.specialistExcludeCombo.setSelected(filters.specialistExcludeIds || []);
+        if (ui.triageInclude) ui.triageInclude.value = filters.triageInclude || "";
+        if (ui.triageExclude) ui.triageExclude.value = filters.triageExclude || "";
+        if (host && host.shadowRoot && filters.triageFields) {
+            const wanted = new Set(filters.triageFields);
+            host.shadowRoot.querySelectorAll(".triage-field").forEach(input => { input.checked = wanted.has(input.value); });
+        }
         // Pessoas (Especialista/Solicitado) agora vivem em "Filtros avançados",
         // não mais como tags nesta área — só Status/Unidade têm tag pra abrir.
         openStatsTagIfFilled("statsStatusSlot", (filters.statusValues && filters.statusValues.length) || (filters.statusOperacionalValues && filters.statusOperacionalValues.length));
@@ -7047,6 +7201,12 @@
 
             /* Recortes congelados e refinamento — mesma linguagem visual das
                outras faixas de estado (contagens/índice), sem inventar mais uma. */
+            .excl-tag { color: var(--v-danger-text); font-weight: 700; text-transform: uppercase; font-size: 9.5px; letter-spacing: .04em; }
+            .triage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+            .triage-grid textarea { width: 100%; min-height: 56px; padding: 7px 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; font-family: inherit; resize: vertical; }
+            .triage-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+            @media (max-width: 860px) { .triage-grid { grid-template-columns: 1fr; } }
+
             .snapshot-panel { padding: 12px 20px; background: var(--v-panel-alt); border-bottom: 1px solid var(--v-panel-alt-border); flex-shrink: 0; max-height: 30vh; overflow-y: auto; }
             .snapshot-panel[hidden] { display: none; }
             .snapshot-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
@@ -7303,7 +7463,7 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="stats-tag-slot control" id="statsUnidadeSlot" hidden><label>Unidade/Comarca</label>
+                        <div class="stats-tag-slot" id="statsUnidadeSlot" hidden><div class="control"><label>Unidade/Comarca</label>
                             <div class="combo" id="unidadeCombo">
                                 <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar unidades...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
                                 <div class="combo-panel">
@@ -7312,6 +7472,19 @@
                                     <div class="combo-options"></div>
                                     <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
                                 </div>
+                            </div>
+                            </div>
+                            <div class="control" style="margin-top:10px"><label>Unidade/Comarca — <span class="excl-tag">excluir</span></label>
+                                <div class="combo" id="unidadeExcludeCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Nenhuma unidade excluída</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Ex.: campinas, araraquara..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                                <small class="person-hint">As unidades marcadas aqui ficam DE FORA do resultado</small>
                             </div>
                         </div>
                     </div>
@@ -7347,6 +7520,14 @@
                                 </div>
                                 <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
                             </div>
+                            <div class="control person-control" id="filterRequestedForExcludeControl"><label>Solicitado para — <span class="excl-tag">excluir</span></label>
+                                <div class="person-multi" id="requestedForExcludeCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
+                            </div>
                             <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label>
                                 <div class="person-multi" id="specialistCombo">
                                     <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
@@ -7354,6 +7535,14 @@
                                     <div class="person-chips"></div>
                                 </div>
                                 <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
+                            </div>
+                            <div class="control person-control" id="filterSpecialistExcludeControl"><label>Designado Especialista — <span class="excl-tag">excluir</span></label>
+                                <div class="person-multi" id="specialistExcludeCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Quem estiver aqui fica DE FORA do resultado</small>
                             </div>
                         </div>
                         <label class="option" style="margin-top:10px" id="filterVipControl"><input class="vip-only" type="checkbox"><span>Usuário VIP</span></label>
@@ -7387,6 +7576,23 @@
                                 <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
                             </div>
                             <label class="option ignore-gse-wrap"><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
+                        </section>
+                        <section class="panel" style="grid-column:1/-1"><h3>Triagem por termo (2ª passada, sobre o resultado)</h3>
+                            <small class="person-hint">Roda DEPOIS da busca, sobre o que ela devolveu. Diferente do termo lá de cima, aqui os campos marcados viram um texto só — então "não pode conter" descarta o chamado mesmo quando o termo indesejado aparece num campo diferente daquele que o trouxe para o resultado. Sem consultar o SMAX.</small>
+                            <div class="field-checks" style="margin-top:8px"><span class="field-checks-label">Olhar em:</span>
+                                <label class="option-inline"><input class="triage-field" type="checkbox" value="description" checked><span>Descrição</span></label>
+                                <label class="option-inline"><input class="triage-field" type="checkbox" value="solution" checked><span>Solução</span></label>
+                                <label class="option-inline"><input class="triage-field" type="checkbox" value="discussion"><span>Discussão</span></label>
+                            </div>
+                            <div class="triage-grid">
+                                <div class="control"><label>Deve conter pelo menos um destes termos (um por linha)</label>
+                                    <textarea class="triage-include" rows="3" placeholder="Ex.: automação"></textarea>
+                                </div>
+                                <div class="control"><label>NÃO pode conter nenhum destes termos (um por linha)</label>
+                                    <textarea class="triage-exclude" rows="3" placeholder="Ex.: homologação"></textarea>
+                                </div>
+                            </div>
+                            <div class="triage-actions"><button type="button" class="tiny triage-clear">Limpar triagem</button><small class="person-hint">Vale também ao refinar um recorte congelado.</small></div>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Passou por GSE</h3>
                             <small class="person-hint">Mostrar somente solicitações que passaram por estas GSEs (consulta o histórico de cada uma).</small>
@@ -7631,6 +7837,9 @@
             requestedForComboRoot: shadow.getElementById("requestedForCombo"), specialistComboRoot: shadow.getElementById("specialistCombo"), vipOnly: shadow.querySelector(".vip-only"), globalOnly: shadow.querySelector(".global-only"),
             statusComboRoot: shadow.getElementById("statusCombo"), statusOperacionalComboRoot: shadow.getElementById("statusOperacionalCombo"), unidadeComboRoot: shadow.getElementById("unidadeCombo"),
             statsSearch: shadow.querySelector(".stats-search"),
+            requestedForExcludeComboRoot: shadow.getElementById("requestedForExcludeCombo"), specialistExcludeComboRoot: shadow.getElementById("specialistExcludeCombo"),
+            unidadeExcludeComboRoot: shadow.getElementById("unidadeExcludeCombo"),
+            triageInclude: shadow.querySelector(".triage-include"), triageExclude: shadow.querySelector(".triage-exclude"), triageClear: shadow.querySelector(".triage-clear"),
             dateMode: shadow.querySelector(".date-mode"), dateFrom: shadow.querySelector(".date-from"), dateTo: shadow.querySelector(".date-to"), dateDays: shadow.querySelector(".date-days"),
             dateFromWrap: shadow.querySelector(".date-from-wrap"), dateToWrap: shadow.querySelector(".date-to-wrap"), dateDaysWrap: shadow.querySelector(".date-days-wrap"), dateFromLabel: shadow.querySelector(".date-from-label"), dateToLabel: shadow.querySelector(".date-to-label"),
             solutionDateMode: shadow.querySelector(".solution-date-mode"), solutionDateFrom: shadow.querySelector(".solution-date-from"), solutionDateTo: shadow.querySelector(".solution-date-to"), solutionDateDays: shadow.querySelector(".solution-date-days"),
@@ -8070,6 +8279,7 @@
             button.addEventListener("click", () => { openExportOptionsModal(button.dataset.format); closeExportMenu(); });
         });
         ui.copyButton.addEventListener("click", copySummary);
+        ui.triageClear.addEventListener("click", () => { ui.triageInclude.value = ""; ui.triageExclude.value = ""; });
 
         // Congelar/refinar. O modal de exportação vive neste escopo, então a
         // tabela de recortes chega até ele por esta referência — em vez de uma
@@ -8204,6 +8414,12 @@
         ui.statusCombo = installStaticCombobox(ui.statusComboRoot, shadow, STATUS_LABELS);
         ui.statusOperacionalCombo = installStaticCombobox(ui.statusOperacionalComboRoot, shadow, STATUS_OPERACIONAL_LABELS);
         ui.unidadeCombo = installLocationCombobox(ui.unidadeComboRoot, shadow);
+        // Excludentes: mesmos componentes dos campos de inclusão, lidos por
+        // multiValueExcludes em advancedFiltersMatch — então valem igual na
+        // busca e no refinamento de um recorte congelado.
+        ui.unidadeExcludeCombo = installLocationCombobox(ui.unidadeExcludeComboRoot, shadow);
+        ui.requestedForExcludeCombo = installPersonMultiAutocomplete(ui.requestedForExcludeComboRoot, shadow);
+        ui.specialistExcludeCombo = installPersonMultiAutocomplete(ui.specialistExcludeComboRoot, shadow);
         ui.historyGseCombo = installGseCombobox(ui.historyGseComboRoot, shadow);
         // Mesmo atalho de equipe que já existe em Configurações, aplicado
         // aqui: um clique marca/desmarca todas as GSEs da equipe dentro
