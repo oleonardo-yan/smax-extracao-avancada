@@ -97,7 +97,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "4.22.4";
+    const VERSION = "0.1.0"; // acompanha o @version deste script (a 4.22.4 era a da Pesquisa Avançada, de onde este veio)
     const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
     const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
     // Primeira página de cada lote menor e prioritária (canal próprio), pra
@@ -5045,7 +5045,7 @@
     async function exportTxt(fields, reportName) {
         const rows = await exportRowsReady({ needDiscussion: fields.some(f => f.key === "discussion") });
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
-        const head = [reportName && reportName.trim() ? reportName.trim() : "Pesquisa no Acervo SMAX",
+        const head = [reportName && reportName.trim() ? reportName.trim() : "Extração do Acervo SMAX",
             `${rows.length} solicitação(ões) · ${new Date().toLocaleString("pt-BR")}`, "=".repeat(60), ""].join("\n");
         const parts = rows.map(item => fields.map(f => `${f.label}: ${f.get(item)}`).concat("-".repeat(60)).join("\n"));
         downloadFile(`acervo-smax-${timestamp()}.txt`, head + parts.join("\n\n"), "text/plain");
@@ -5061,7 +5061,7 @@
         const idField = fields.find(f => f.key === "id");
         const shortFields = fields.filter(f => !f.long && f.key !== "id");
         const longFields = fields.filter(f => f.long);
-        const lines = [`# ${o.reportName && o.reportName.trim() ? escBlock(o.reportName.trim()) : "Pesquisa no Acervo SMAX"}`,
+        const lines = [`# ${o.reportName && o.reportName.trim() ? escBlock(o.reportName.trim()) : "Extração do Acervo SMAX"}`,
             "", `${rows.length} solicitação(ões) · exportado em ${new Date().toLocaleString("pt-BR")}`, ""];
 
         if (o.includeFilters !== false) {
@@ -7213,12 +7213,12 @@
                 .keyboard-help { display: none; }
             }
         </style>
-        <button class="launcher" type="button" title="Pesquisa completa no acervo SMAX"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg></button>
+        <button class="launcher" type="button" title="Extração avançada do acervo SMAX"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg></button>
         <button class="restore-pill" type="button" hidden></button>
         <div class="overlay"><section class="dialog"><div class="dialog-zoom">
             <header class="top">
                 <svg class="top-icon" viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg>
-                <div class="top-titles"><h2>Pesquisa Avançada SMAX</h2><small>v${VERSION} · Pesquisa por termos e estatística nas solicitações do SMAX</small></div>
+                <div class="top-titles"><h2>Extração Avançada SMAX</h2><small>v${VERSION} · Levantamento, contagens e recortes congelados das solicitações do SMAX</small></div>
                 <button class="header-icon-btn theme-toggle" type="button" title="Alternar tema claro/escuro">
                     <svg class="icon-moon" viewBox="0 0 24 24"><path d="M21 12.5A8.5 8.5 0 1111.5 3a7 7 0 009.5 9.5z"></path></svg>
                     <svg class="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"></circle><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"></path></svg>
@@ -8246,7 +8246,7 @@
         requestPersistentStorage();
         reportSavedIndexOnStartup();
         startAutoSync();
-        console.log(`[TJSP] Pesquisa Avançada SMAX ${VERSION} carregada.`);
+        console.log(`[TJSP] SMAX - Extração Avançada ${VERSION} carregada.`);
     }
 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true });
