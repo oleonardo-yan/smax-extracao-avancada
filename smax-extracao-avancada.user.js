@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX - Extração Avançada
 // @namespace    https://github.com/oleonardo-yan/smax-extracao-avancada
-// @version      0.1.0
+// @version      0.1.1
 // @description  Extração avançada de dados do acervo SMAX: busca por filtros estruturados (com ou sem termo), agregações/contagens e snapshots refináveis (congelar/refinar) para levantamentos que sempre somam certo
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -98,7 +98,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "0.1.0"; // acompanha o @version deste script (a 4.22.4 era a da Pesquisa Avançada, de onde este veio)
+    const VERSION = "0.1.1"; // acompanha o @version deste script (a 4.22.4 era a da Pesquisa Avançada, de onde este veio)
     const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
     const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
     // Primeira página de cada lote menor e prioritária (canal próprio), pra
