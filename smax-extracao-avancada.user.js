@@ -3001,8 +3001,17 @@
     // ============================================================
     // PESQUISA TEXTUAL (operadores lógicos)
     // ============================================================
+    // Caracteres invisíveis que o editor do SMAX (ou o copiar/colar do
+    // navegador) deixa no meio do texto: hífen opcional, espaço de largura
+    // zero, BOM. Não aparecem na tela, mas quebram qualquer comparação literal.
+    const INVISIBLE_CHARS = /[­​-‍⁠﻿]/g;
+
     function normalize(value, ignoreCase, ignoreAccents) {
-        let text = String(value || "");
+        // NFC sempre: o mesmo "ú" pode chegar composto (1 caractere) ou
+        // decomposto (u + acento). Com "ignorar acentos" desmarcado, os dois
+        // não batiam entre si mesmo sendo idênticos na tela.
+        let text = String(value || "").replace(INVISIBLE_CHARS, "");
+        try { text = text.normalize("NFC"); } catch (_) {}
         if (ignoreAccents) try { text = text.normalize("NFD").replace(/[̀-ͯ]/g, ""); } catch (_) {}
         return ignoreCase ? text.toLocaleLowerCase("pt-BR") : text;
     }
@@ -3077,13 +3086,22 @@
     // procurada literalmente, aspas internas incluídas, como um único bloco.
     // É o que faz a busca corresponder ao que a interface promete ("a
     // expressão exata …"). Ambiente sem lookbehind cai no substring de sempre.
+    // O ESPAÇO entre as palavras da frase casa com qualquer sequência de
+    // espaço em branco do texto: quebra de linha (o HTML original quebra a
+    // linha no meio da frase e o textContent preserva), espaço inseparável
+    // (&nbsp;), espaço fino, espaço duplo. Na tela tudo isso é "um espaço" —
+    // exigir o caractere de espaço literal fazia a frase sumir de chamados
+    // que a contêm de verdade.
     function buildBlockTester(needle) {
+        needle = needle.trim();
         if (!needle) return () => true; // aspas vazias: mantém o "casa tudo" antigo
+        const body = needle.split(/\s+/).map(escapeRegExp).join("\\s+");
         try {
-            const re = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(needle)}(?![\\p{L}\\p{N}])`, "u");
+            const re = new RegExp(`(?<![\\p{L}\\p{N}])${body}(?![\\p{L}\\p{N}])`, "u");
             return text => re.test(text);
         } catch (_) {
-            return text => text.includes(needle);
+            const flat = needle.replace(/\s+/g, " ");
+            return text => text.replace(/\s+/g, " ").includes(flat);
         }
     }
 
@@ -5896,6 +5914,7 @@
     const HIGHLIGHT_ACCENT_CLASS = { a: "aàáâã", e: "eèéê", i: "iìí", o: "oòóôõ", u: "uùú", c: "cç" };
     function accentInsensitivePattern(term) {
         return term.split("").map(ch => {
+            if (/\s/.test(ch)) return "\\s+"; // frase quebrada em linhas também é destacada
             const variant = HIGHLIGHT_ACCENT_CLASS[ch.toLocaleLowerCase("pt-BR")];
             return variant ? `[${variant}${variant.toLocaleUpperCase("pt-BR")}]` : escapeRegExp(ch);
         }).join("");
